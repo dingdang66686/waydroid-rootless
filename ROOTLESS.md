@@ -80,38 +80,39 @@ The image build is in
 
 ## Local overlay (startup rebuild)
 
-The application supports a private local overlay, checked at every container
-start (including `container restart`; there is no watcher):
+The application supports a private local file-tree overlay, checked at every
+container start (including `container restart`; there is no watcher):
 
 ```text
-$WORK/overlay/           # upstream lowerdir layout
+$WORK/overlay/
   system/...             files added/replaced under /system
   vendor/...             files added/replaced under /vendor
   ...                    any other rootfs-relative path
-  props/                 optional extension: property fragments
-    system/build.prop
-    vendor/build.prop
-    vendor/odm/etc/build.prop
-  remove.list            optional extension: root-relative paths to delete
-  rootfs/                legacy self-contained layout from the first iteration
 ```
 
-The tree follows upstream Waydroid's persistent `$WORK/overlay` lowerdir:
-`system/`, `vendor/`, and the rest are rootfs-relative, and `mount_overlays =
-False` disables it.  `props/`, `remove.list`, `.wh.` whiteouts, and the legacy
-`rootfs/` child are local extensions; an upstream overlay tree without them
-works unchanged.  `overlay_rw`/`overlay_work` are not used by the podman backend
-(its container layer is ephemeral); `/data` remains the persistent session state.
+Only basic file-tree semantics are supported: files, directories and symlinks
+are added or replaced.  Use full files (for example
+`overlay/system/build.prop`).  `props/`, `remove.list`, `.wh.` whiteouts and the
+old `rootfs/` layout are not supported; deletions are not possible with a COPY
+layer.
 
-On start the backend hashes the active overlay inputs and compares the result
-with `$WORK/podman-overlay.stamp`, together with the base image ID.  If nothing
-changed it reuses the derived image.  Otherwise it exports the configured
-`podman_image` without booting it, applies `remove.list` / the overlay tree
-(including `.wh.` whiteouts) / `props/`, fixes world-read permissions, and imports
-`podman_overlay_image` (default `localhost/waydroid-overlay:<base tag>`).  The
-configured `podman_image` remains the clean base; only the running session uses
-the derived tag.  A failed rebuild is a hard error instead of silently booting
-without the compatibility layer.
+A basic overlay is built as a **COPY-only layer** on the configured base:
+
+```text
+podman build FROM <podman_image> COPY <overlay> /
+```
+
+Base layers stay shared in containers/storage, so the derived image only adds
+the overlay layer (the ARM layer is about 45 MB); the base is not exported and
+there is no second flattened copy.
+
+On start the backend hashes the overlay and compares it with
+`$WORK/podman-overlay.stamp`, together with the base image ID and derived image
+ID.  If nothing changed it reuses the derived image.  Otherwise it rebuilds the
+layer.  `mount_overlays = False` disables the feature.  The configured
+`podman_image` remains the clean base; only the running session uses the derived
+tag.  A failed rebuild is a hard error instead of silently booting without the
+compatibility layer.
 
 Optional config keys:
 
@@ -120,11 +121,9 @@ podman_overlay_path = /home/you/.local/state/waydroid/overlay
 podman_overlay_image = localhost/waydroid-overlay:13
 ```
 
-The overlay is flattened into a new local image; it is not a runtime overlay,
-so the runtime contract is unchanged.  `overlay/` and the derived image are
-local/private: do not commit proprietary prebuilts (for example the ARM
-translation layer) or push a derived image containing them.  The public image
-and its CI remain clean and never read this directory.
+The overlay and derived image are local/private: do not commit proprietary
+prebuilts (for example the ARM translation layer) or push a derived image
+containing them.
 
 ## Image-mode commands
 

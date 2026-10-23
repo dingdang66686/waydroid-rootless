@@ -1431,33 +1431,43 @@ same pull/tag, runs `setup_host()` (named volume + base props) and starts the
 user service; a failed pull leaves any running container untouched.  The
 `/data` volume is preserved.
 
-### C.8 Local overlay rebuild at session start
+### C.8 Local overlay layer at session start
 
-The public image stays clean; a user may keep a private overlay tree in
-`$WORK/overlay` (configurable with `podman_overlay_path`).  The layout is:
+The public image stays clean; a user may keep a private file-tree overlay in
+`$WORK/overlay` (configurable with `podman_overlay_path`):
 
 ```
-$WORK/overlay/         # upstream lowerdir layout
+$WORK/overlay/
   system/...           files added/replaced under /system
   vendor/...           files added/replaced under /vendor
   ...                  other rootfs-relative paths
-  props/               optional extension: property fragments
-  remove.list          optional extension: root-relative paths to delete
-  rootfs/              legacy self-contained layout from the first iteration
 ```
+
+Only basic file-tree semantics are supported: files, directories and symlinks
+are added or replaced.  Full files are used; deletions, whiteouts and property
+merging are not part of the mechanism.  This keeps the implementation and the
+resulting layer predictable.
+
+A basic overlay is built as a COPY-only layer:
+
+```
+podman build  FROM <podman_image>  COPY <overlay> /
+```
+
+containers/storage keeps the base layers shared; the derived image adds only the
+overlay layer (about 45 MB for the ARM translation layer).  There is no base
+export and no flattened second copy.  `podman build` only does `COPY`; the
+unbooted Android rootfs is never executed.
 
 `runtime/overlay.py` runs from `prepare_session()` and again from `start()`
 (the latter covers `container restart`, which bypasses `prepare_session`), so
 the check happens at every container start, not on a file watcher.  It hashes
-the active overlay inputs (paths, modes, symlink targets, file contents,
-`remove.list`) and records the result together with the base image ID and the
-derived image ID in `$WORK/podman-overlay.stamp`.  When both the fingerprint and
-the base image are unchanged and the derived image still exists, it returns the
-cached derived tag; otherwise it exports the base image without booting it
-(`podman create` + `podman export`), applies the overlay on the host, removes
-the container-only `/dev` entries and `/run/.containerenv`, and re-imports the
-flattened tar as `podman_overlay_image` (default
-`localhost/waydroid-overlay:<base tag>`).  A lock serialises concurrent starts.
+the overlay inputs (paths, modes, symlink targets, file contents) and records
+the result together with the base image ID and derived image ID in
+`$WORK/podman-overlay.stamp`.  When both the fingerprint and the base image are
+unchanged and the derived image still exists, it returns the cached derived
+tag; otherwise it rebuilds the layer.  A lock serialises concurrent starts.
+`mount_overlays = False` disables the feature.
 
 The runtime image override is kept in memory (`args.podman_overlay_image`); the
 configured `podman_image` still points at the clean base, so `upgrade`/`init`
@@ -1465,16 +1475,7 @@ and `is_initialized()` keep working.  The derived image is local only; nothing
 is pushed.  A failed rebuild is fatal rather than silently booting without the
 layer, because the overlay is usually the user's compatibility layer.
 
-The tree is the persistent half of upstream's runtime overlay: `$WORK/overlay`
-is its lowerdir, it survives `upgrade`/`init`, and `mount_overlays = False`
-disables it.  The podman backend does not implement upstream's
-`overlay_rw`/`overlay_work` upperdir: the container rootfs layer is ephemeral
-and `/data` is the persistent session state.  `props/`, `remove.list`, `.wh.`
-whiteouts, and the legacy `rootfs/` child are local extensions; an upstream
-overlay tree containing only `system/` and `vendor/` works unchanged.
-
 This is deliberately separate from the image repository: the public CI does not
 read `overlay/`, and proprietary files (for example the ARM translation layer)
-never enter the public tree or GHCR package.  The overlay is flattened into the
-derived image rather than being a runtime overlay, so the runtime contract is
-still one OCI image plus the named `/data` volume.
+never enter the public tree or GHCR package.
+
