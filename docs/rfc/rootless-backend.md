@@ -1445,8 +1445,8 @@ $WORK/overlay/
 
 Only basic file-tree semantics are supported: files, directories and symlinks
 are added or replaced.  Full files are used; deletions, whiteouts and property
-merging are not part of the mechanism.  This keeps the implementation and the
-resulting layer predictable.
+merging are not part of the mechanism and are rejected.  This keeps the
+implementation and the resulting layer predictable.
 
 A basic overlay is built as a COPY-only layer:
 

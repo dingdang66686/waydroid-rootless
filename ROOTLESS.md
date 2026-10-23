@@ -93,8 +93,8 @@ $WORK/overlay/
 Only basic file-tree semantics are supported: files, directories and symlinks
 are added or replaced.  Use full files (for example
 `overlay/system/build.prop`).  `props/`, `remove.list`, `.wh.` whiteouts and the
-old `rootfs/` layout are not supported; deletions are not possible with a COPY
-layer.
+old `rootfs/` layout are not supported and are rejected; deletions are not
+possible with a COPY layer.
 
 A basic overlay is built as a **COPY-only layer** on the configured base:
 
