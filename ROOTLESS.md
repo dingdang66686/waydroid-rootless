@@ -36,7 +36,8 @@ no runtime overlay, and no per-run bind-mount of the Android `.rc` files.
 git clone https://github.com/dingdang66686/waydroid-rootless
 cd waydroid-rootless
 
-# The plain patched Android 13 image published by this project:
+# The plain patched Android 13 image published by this project
+# (if the GHCR package is private, run `podman login ghcr.io` first):
 podman pull ghcr.io/dingdang66686/waydroid-rootless-image:13
 
 ./install-rootless.sh install
