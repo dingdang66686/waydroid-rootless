@@ -78,6 +78,23 @@ def _overlay_image(args, cfg, base):
     return "{}:{}".format(DEFAULT_IMAGE_PREFIX, tag)
 
 
+def _validate_tree(path):
+    """Reject the removed extension syntax instead of silently layering it."""
+    for name, label in (("props", "props/ property merging"),
+                        ("rootfs", "the legacy rootfs/ layout"),
+                        ("remove.list", "remove.list deletion support")):
+        if os.path.lexists(os.path.join(path, name)):
+            raise RuntimeError(
+                "{} is not supported; use a basic file tree with full files "
+                "under system/ and vendor/".format(label))
+    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+        for name in dirnames + filenames:
+            if name == ".wh..wh..opq" or name.startswith(".wh."):
+                raise RuntimeError(
+                    "whiteout entries are not supported; only basic file-tree "
+                    "overlays are available")
+
+
 def _active(path):
     """True when the tree contains at least one file or symlink.
 
@@ -262,6 +279,8 @@ def ensure(args, cfg):
         return None
 
     path = _overlay_path(args, cfg)
+    if os.path.isdir(path):
+        _validate_tree(path)
     if not _active(path):
         return None
 
