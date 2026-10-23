@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import logging
 import os
+import subprocess
 from tools import helpers
 import tools.config
 import stat
@@ -17,7 +18,7 @@ import argparse
 from gi.repository import GLib
 
 def is_initialized(args):
-    return os.path.isfile(args.config) and os.path.isdir(tools.config.defaults["rootfs"])
+    return helpers.runtime.is_initialized(args)
 
 def get_vendor_type(args):
     vndk_str = helpers.props.host_get(args, "ro.vndk.version")
@@ -48,10 +49,13 @@ def setup_config(args):
     args.vendor_type = get_vendor_type(args)
     cfg["waydroid"]["vendor_type"] = args.vendor_type
 
-    helpers.drivers.setupBinderNodes(args)
-    cfg["waydroid"]["binder"] = args.BINDER_DRIVER
-    cfg["waydroid"]["vndbinder"] = args.VNDBINDER_DRIVER
-    cfg["waydroid"]["hwbinder"] = args.HWBINDER_DRIVER
+    # The rootful runtime needs the host binder nodes set up (and chmod'ed) by
+    # root.  A rootless backend never touches them.
+    if helpers.runtime.needs_root(args):
+        helpers.drivers.setupBinderNodes(args)
+        cfg["waydroid"]["binder"] = args.BINDER_DRIVER
+        cfg["waydroid"]["vndbinder"] = args.VNDBINDER_DRIVER
+        cfg["waydroid"]["hwbinder"] = args.HWBINDER_DRIVER
 
     has_preinstalled_images = False
     preinstalled_images_paths = tools.config.defaults["preinstalled_images_paths"]
@@ -127,17 +131,71 @@ def setup_config(args):
     tools.config.save(args, cfg)
     return True
 
+def _init_image(args, backend):
+    """Image mode: pull the published image, tag it, prepare the host and
+    start the per-user service.  A failed pull leaves the running container
+    untouched."""
+    cfg = tools.config.load(args)
+    image = cfg["waydroid"].get("podman_image") or ""
+    remote = cfg["waydroid"].get("podman_image_remote") or image
+    if not image and remote:
+        cfg["waydroid"]["podman_image"] = remote
+        tools.config.save(args, cfg)
+        image = remote
+    if not image:
+        logging.error("podman_image or podman_image_remote must be set")
+        return
+
+    logging.info("Pulling %s", remote)
+    try:
+        result = subprocess.run(["podman", "pull", remote],
+                                capture_output=True, text=True, timeout=600)
+    except Exception as e:
+        logging.error("podman pull failed: %s", e)
+        return
+    if result.returncode != 0:
+        logging.error("podman pull %s failed: %s", remote,
+                      (result.stderr or result.stdout).strip())
+        return
+    if remote != image:
+        tagged = subprocess.run(["podman", "tag", remote, image],
+                                capture_output=True, text=True)
+        if tagged.returncode != 0:
+            logging.error("podman tag %s %s failed: %s", remote, image,
+                          (tagged.stderr or tagged.stdout).strip())
+            return
+        logging.info("Tagged %s as %s", remote, image)
+
+    backend.setup_host(args)
+    if helpers.service.restart_user_service(args):
+        logging.info("Started waydroid.service")
+    else:
+        logging.warning("Image ready; start a session with "
+                        "`waydroid session start`")
+
+
 def init(args):
+    backend = helpers.runtime.get(args)
+    if getattr(backend, "uses_image", None) and backend.uses_image(args):
+        _init_image(args, backend)
+        return
+
     if is_initialized(args) and not args.force:
         logging.info("Already initialized")
 
     if not setup_config(args):
         return
 
+    if not helpers.runtime.needs_root(args):
+        # Rootless backend: no LXC config, no host permission surgery -- only
+        # backend-specific host preparation (base props, state directories).
+        backend.setup_host(args)
+        return
+
     status = "STOPPED"
     session = None
     if os.path.exists(tools.config.defaults["lxc"] + "/waydroid"):
-        status = helpers.lxc.status(args)
+        status = backend.status(args)
     if status != "STOPPED":
         if "running_init_in_service" in args:
             session = args.session
@@ -145,7 +203,7 @@ def init(args):
         else:
             logging.info("Stopping container")
             try:
-                container = tools.helpers.ipc.DBusContainerService()
+                container = tools.helpers.ipc.DBusContainerService(args)
                 session = container.GetSession()
                 container.Stop(False)
             except Exception as e:
@@ -165,9 +223,7 @@ def init(args):
         os.mkdir(tools.config.defaults["overlay_rw"]+"/system")
         os.mkdir(tools.config.defaults["overlay_rw"]+"/vendor")
     helpers.drivers.probeAshmemDriver(args)
-    helpers.lxc.setup_host_perms(args)
-    helpers.lxc.set_lxc_config(args)
-    helpers.lxc.make_base_props(args)
+    backend.setup_host(args)
     if status != "STOPPED":
         try:
             if "running_init_in_service" in args:
@@ -424,7 +480,7 @@ def remote_init_client(args):
         def on_destroy(self, _):
             if self.initializing:
                 try:
-                    tools.helpers.ipc.DBusContainerService("/Initializer", "id.waydro.Initializer").Cancel()
+                    tools.helpers.ipc.DBusContainerService(args, "/Initializer", "id.waydro.Initializer").Cancel()
                 except Exception as e:
                     logging.debug("Unexpected error while cancelling initializer: %s", e)
             Gtk.main_quit()
@@ -438,7 +494,7 @@ def remote_init_client(args):
             self.initializing = True
 
             try:
-                initializer = tools.helpers.ipc.DBusContainerService("/Initializer", "id.waydro.Initializer")
+                initializer = tools.helpers.ipc.DBusContainerService(args, "/Initializer", "id.waydro.Initializer")
 
                 self.bus_signals.append(initializer.connect_to_signal("ProgressChanged", self.on_progress))
                 self.bus_signals.append(initializer.connect_to_signal("Finished", self.on_finished))

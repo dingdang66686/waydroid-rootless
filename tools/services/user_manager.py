@@ -19,7 +19,9 @@ def start(args, session, unlocked_cb=None):
     apps_dir.mkdir(0o700, exist_ok=True)
 
     waydroid_user_state_dir = Path(session["waydroid_user_state"])
-    waydroid_data_icons_dir = Path(session["waydroid_data"]) / "icons"
+    waydroid_data_icons_dir = Path(
+        session.get("waydroid_icons")
+        or (Path(session["waydroid_data"]) / "icons"))
 
     system_apps = [
         "com.android.calculator2",

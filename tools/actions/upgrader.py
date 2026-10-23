@@ -2,17 +2,20 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import logging
 import os
+import subprocess
 from tools import helpers
 from tools.helpers.version import versiontuple
 import tools.config
 
 def get_config(args):
     cfg = tools.config.load(args)
-    args.arch = cfg["waydroid"]["arch"]
-    args.images_path = cfg["waydroid"]["images_path"]
-    args.vendor_type = cfg["waydroid"]["vendor_type"]
-    args.system_ota = cfg["waydroid"]["system_ota"]
-    args.vendor_ota = cfg["waydroid"]["vendor_ota"]
+    args.arch = cfg["waydroid"].get("arch") or tools.config.defaults["arch"]
+    args.images_path = (cfg["waydroid"].get("images_path")
+                        or tools.config.defaults["images_path"])
+    args.vendor_type = (cfg["waydroid"].get("vendor_type")
+                        or tools.config.defaults["vendor_type"])
+    args.system_ota = cfg["waydroid"].get("system_ota") or "None"
+    args.vendor_ota = cfg["waydroid"].get("vendor_ota") or "None"
     args.session = None
 
 def migration(args):
@@ -31,15 +34,68 @@ def migration(args):
     except Exception as e:
         logging.debug("Error during migration: %s", e)
 
+def _upgrade_image(args):
+    """Image mode: pull the published image (or skip with --offline) and
+    restart the per-user service.  A failed pull leaves the running image and
+    container untouched."""
+    cfg = tools.config.load(args)
+    image = cfg["waydroid"].get("podman_image") or ""
+    remote = cfg["waydroid"].get("podman_image_remote") or image
+    if not image:
+        logging.error("podman_image is not set")
+        return
+
+    if not args.offline:
+        if not remote:
+            logging.error("podman_image_remote is not set")
+            return
+        logging.info("Pulling %s", remote)
+        try:
+            result = subprocess.run(["podman", "pull", remote],
+                                    capture_output=True, text=True,
+                                    timeout=600)
+        except Exception as e:
+            logging.error("podman pull failed: %s", e)
+            return
+        if result.returncode != 0:
+            logging.error("podman pull %s failed: %s", remote,
+                          (result.stderr or result.stdout).strip())
+            logging.error("The running image is unchanged. Set "
+                          "podman_image_remote to the published image, or "
+                          "rebuild locally with image/build.sh and run "
+                          "`waydroid upgrade --offline`.")
+            return
+        if remote != image:
+            tagged = subprocess.run(["podman", "tag", remote, image],
+                                    capture_output=True, text=True)
+            if tagged.returncode != 0:
+                logging.error("podman tag %s %s failed: %s", remote, image,
+                              (tagged.stderr or tagged.stdout).strip())
+                return
+            logging.info("Tagged %s as %s", remote, image)
+
+    if helpers.service.restart_user_service(args):
+        logging.info("Restarted waydroid.service")
+        return
+
+    logging.warning("Could not restart waydroid.service; stopping the running "
+                    "container. Start a new session with `waydroid session "
+                    "start` after the image is ready.")
+    from tools.actions import container_manager
+    container_manager.stop(args)
+
+
 def upgrade(args):
+    backend = helpers.runtime.get(args)
+    if getattr(backend, "uses_image", None) and backend.uses_image(args):
+        _upgrade_image(args)
+        return
     get_config(args)
-    status = "STOPPED"
-    if os.path.exists(tools.config.defaults["lxc"] + "/waydroid"):
-        status = helpers.lxc.status(args)
+    status = backend.status(args)
     if status != "STOPPED":
         logging.info("Stopping container")
         try:
-            container = tools.helpers.ipc.DBusContainerService()
+            container = tools.helpers.ipc.DBusContainerService(args)
             args.session = container.GetSession()
             container.Stop(False)
         except Exception as e:
@@ -53,9 +109,7 @@ def upgrade(args):
         else:
             logging.info("Upgrade refused because Waydroid was configured to load pre-installed image from {}.".format(args.images_path))
     helpers.drivers.probeAshmemDriver(args)
-    helpers.lxc.setup_host_perms(args)
-    helpers.lxc.set_lxc_config(args)
-    helpers.lxc.make_base_props(args)
+    backend.setup_host(args)
     if status != "STOPPED":
         logging.info("Starting container")
         try:

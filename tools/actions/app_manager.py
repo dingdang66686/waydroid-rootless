@@ -13,24 +13,37 @@ import dbus
 
 def install(args):
     try:
-        tools.helpers.ipc.DBusSessionService()
+        tools.helpers.ipc.DBusSessionService(args)
 
-        cm = tools.helpers.ipc.DBusContainerService()
+        cm = tools.helpers.ipc.DBusContainerService(args)
         session = cm.GetSession()
         if session["state"] == "FROZEN":
             cm.Unfreeze()
 
-        tmp_dir = tools.config.session_defaults["waydroid_data"] + "/waydroid_tmp"
-        if not os.path.exists(tmp_dir):
-            os.makedirs(tmp_dir)
+        backend = tools.helpers.runtime.get(args)
+        push = getattr(backend, "push_apk", None)
+        if push:
+            apk_path = push(args, args.PACKAGE)
+        else:
+            tmp_dir = (session.get("waydroid_data")
+                       or tools.config.session_defaults["waydroid_data"]) + "/waydroid_tmp"
+            if not os.path.exists(tmp_dir):
+                os.makedirs(tmp_dir)
+            shutil.copyfile(args.PACKAGE, tmp_dir + "/base.apk")
+            apk_path = "/data/waydroid_tmp/base.apk"
 
-        shutil.copyfile(args.PACKAGE, tmp_dir + "/base.apk")
         platformService = IPlatform.get_service(args)
         if platformService:
-            platformService.installApp("/data/waydroid_tmp/base.apk")
+            platformService.installApp(apk_path)
         else:
             logging.error("Failed to access IPlatform service")
-        os.remove(tmp_dir + "/base.apk")
+
+        if push:
+            remove = getattr(backend, "remove_apk", None)
+            if remove:
+                remove(args, apk_path)
+        else:
+            os.remove(tmp_dir + "/base.apk")
 
         if session["state"] == "FROZEN":
             cm.Freeze()
@@ -39,20 +52,28 @@ def install(args):
 
 def remove(args):
     try:
-        tools.helpers.ipc.DBusSessionService()
+        tools.helpers.ipc.DBusSessionService(args)
 
-        cm = tools.helpers.ipc.DBusContainerService()
+        cm = tools.helpers.ipc.DBusContainerService(args)
         session = cm.GetSession()
         if session["state"] == "FROZEN":
             cm.Unfreeze()
 
         platformService = IPlatform.get_service(args)
+        ret = None
         if platformService:
             ret = platformService.removeApp(args.PACKAGE)
-            if ret != 0:
-                logging.error("Failed to uninstall package: {}".format(args.PACKAGE))
-        else:
-            logging.error("Failed to access IPlatform service")
+        if ret != 0:
+            # IPlatform.removeApp returns -1 on some images even though
+            # PackageManager can uninstall the package.
+            fallback = getattr(tools.helpers.runtime.get(args),
+                               "remove_app", None)
+            if fallback is not None and fallback(args, args.PACKAGE) == 0:
+                ret = 0
+                logging.info("Uninstalled {} via the runtime shell".format(
+                    args.PACKAGE))
+        if ret != 0:
+            logging.error("Failed to uninstall package: {}".format(args.PACKAGE))
 
         if session["state"] == "FROZEN":
             cm.Freeze()
@@ -61,9 +82,9 @@ def remove(args):
 
 def maybeLaunchLater(args, launchNow):
     try:
-        tools.helpers.ipc.DBusSessionService()
+        tools.helpers.ipc.DBusSessionService(args)
         try:
-            tools.helpers.ipc.DBusContainerService().Unfreeze()
+            tools.helpers.ipc.DBusContainerService(args).Unfreeze()
         except Exception:
             logging.error("Failed to unfreeze container. Trying to launch anyways...")
         launchNow()
@@ -91,9 +112,9 @@ def launch(args):
 
 def list(args):
     try:
-        tools.helpers.ipc.DBusSessionService()
+        tools.helpers.ipc.DBusSessionService(args)
 
-        cm = tools.helpers.ipc.DBusContainerService()
+        cm = tools.helpers.ipc.DBusContainerService(args)
         session = cm.GetSession()
         if session["state"] == "FROZEN":
             cm.Unfreeze()

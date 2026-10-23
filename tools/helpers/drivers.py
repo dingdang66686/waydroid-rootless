@@ -167,6 +167,28 @@ def setupBinderNodes(args):
             raise OSError('Binder node "hwbinder" for waydroid not found')
 
 def loadBinderNodes(args):
+    # A backend may expose Android's binder nodes through a per-process fd
+    # broker instead of the host's /dev (the rootless podman backend does this:
+    # binderfs is container-local and cannot be reopened from the host).  It
+    # returns gbinder driver names such as "fd/7", which the interfaces turn
+    # into /dev/fd/7.
+    try:
+        from tools.helpers import runtime
+        backend = runtime.get(args)
+        resolver = getattr(backend, "binder_device_paths", None)
+        if resolver is not None:
+            paths = resolver(args)
+            if paths:
+                cfg = tools.config.load(args)
+                (args.BINDER_DRIVER, args.VNDBINDER_DRIVER,
+                 args.HWBINDER_DRIVER) = paths
+                args.BINDER_PROTOCOL = cfg["waydroid"].get("binder_protocol")
+                args.SERVICE_MANAGER_PROTOCOL = cfg["waydroid"].get(
+                    "service_manager_protocol")
+                return
+    except Exception as e:
+        logging.debug("binder device resolver unavailable: %s", e)
+
     cfg = tools.config.load(args)
     args.BINDER_DRIVER = cfg["waydroid"]["binder"]
     args.VNDBINDER_DRIVER = cfg["waydroid"]["vndbinder"]

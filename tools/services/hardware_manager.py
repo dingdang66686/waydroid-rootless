@@ -27,24 +27,27 @@ def start(args):
             tools.actions.container_manager.freeze(args)
 
     def reboot():
-        helpers.lxc.stop(args)
-        helpers.lxc.start(args)
+        backend = helpers.runtime.get(args)
+        backend.stop(args)
+        backend.start(args, getattr(args, "session", None))
 
     def upgrade(system_zip, system_time, vendor_zip, vendor_time):
-        helpers.lxc.stop(args)
+        backend = helpers.runtime.get(args)
+        backend.stop(args)
         helpers.images.umount_rootfs(args)
         helpers.images.replace(args, system_zip, system_time,
                                vendor_zip, vendor_time)
         args.session["background_start"] = "false"
         helpers.images.mount_rootfs(args, args.images_path, args.session)
-        helpers.protocol.set_aidl_version(args)
-        helpers.lxc.start(args)
+        backend.set_protocol(args)
+        backend.start(args, args.session)
 
     def shutdownRequest(reason):
         is_reboot = reason and reason.startswith("1")
         tries = 0
 
-        while helpers.lxc.status(args) != "STOPPED":
+        backend = helpers.runtime.get(args)
+        while backend.status(args) != "STOPPED":
             if tries >= 30:
                 logging.debug(f"Android is still not stopped, give up waiting after {tries} seconds")
                 return
@@ -54,7 +57,7 @@ def start(args):
             tries += 1
 
         if is_reboot:
-            helpers.lxc.start(args)
+            backend.start(args, getattr(args, "session", None))
         else:
             tools.actions.container_manager.stop(args)
 

@@ -22,11 +22,11 @@ class DbusSessionManager(dbus.service.Object):
     @dbus.service.method("id.waydro.SessionManager", in_signature='', out_signature='')
     def Stop(self):
         do_stop(self.args, self.looper)
-        stop_container(quit_session=False)
+        stop_container(self.args, quit_session=False)
 
 def handle_disconnect(args, looper):
     do_stop(args, looper)
-    stop_container(quit_session=False)
+    stop_container(args, quit_session=False)
 
 def service(args, looper):
     bus = dbus.SessionBus()
@@ -47,6 +47,18 @@ def start(args, unlocked_cb=None, background=True):
         return
 
     session = copy.copy(tools.config.session_defaults)
+
+    # A backend may put Android's /data somewhere else (the rootless podman
+    # backend uses $WORK/data instead of the rootful $XDG_DATA_HOME path).
+    data_resolver = getattr(tools.helpers.runtime.get(args),
+                            "waydroid_data_dir", None)
+    if data_resolver:
+        session["waydroid_data"] = data_resolver(args)
+
+    # Android writes the PNGs into /data/icons; the desktop files (the
+    # host-side artifact) reference the backend's host-visible /data mount.
+    # Do not create the directory here: Android owns it.
+    session["waydroid_icons"] = os.path.join(session["waydroid_data"], "icons")
 
     # TODO: also support WAYLAND_SOCKET?
     wayland_display = session["wayland_display"]
@@ -85,7 +97,7 @@ def start(args, unlocked_cb=None, background=True):
 
     def sigint_handler(data):
         do_stop(args, mainloop)
-        stop_container(quit_session=False)
+        stop_container(args, quit_session=False)
 
     def sigusr_handler(data):
         do_stop(args, mainloop)
@@ -94,8 +106,39 @@ def start(args, unlocked_cb=None, background=True):
     GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, sigint_handler, None)
     GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, sigint_handler, None)
     GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGUSR1, sigusr_handler, None)
+
+    # Rootless: this process is the single per-user service.  Own both
+    # well-known names and create the container control objects on this same
+    # bus/loop.  A standalone `waydroid container start` still works: if the
+    # name is already taken we fall back to the D-Bus Start() below.
+    local_container = False
+    container_name = None
+    container_initializer = None
+    if not tools.helpers.runtime.uses_system_bus(args):
+        try:
+            container_name = dbus.service.BusName(
+                "id.waydro.Container", dbus.SessionBus(), do_not_queue=True)
+        except dbus.exceptions.NameExistsException:
+            container_name = None
+        if container_name is not None:
+            from tools.actions import container_manager as _cm
+            from tools.actions import initializer as _init
+            local_container = True
+            args._local_container = True
+            bus = dbus.SessionBus()
+            container_initializer = _init.DbusInitializer(
+                mainloop, bus, '/Initializer', args)
+            _container_objects = _cm.DbusContainerManager(
+                mainloop, bus, '/ContainerManager', args)
+            logging.info("Merged the container and session control planes "
+                         "into this process")
+
     try:
-        tools.helpers.ipc.DBusContainerService().Start(session)
+        if local_container:
+            from tools.actions import container_manager as _cm
+            _cm.do_start(args, session)
+        else:
+            tools.helpers.ipc.DBusContainerService(args).Start(session)
     except dbus.DBusException as e:
         logging.debug(e)
         if e.get_dbus_name().startswith("org.freedesktop.DBus.Python"):
@@ -103,11 +146,27 @@ def start(args, unlocked_cb=None, background=True):
         else:
             logging.error("WayDroid container is not listening")
         sys.exit(0)
+    except Exception as e:
+        logging.error(e)
+        sys.exit(1)
 
-    services.user_manager.start(args, session, unlocked_cb)
-    services.clipboard_manager.start(args)
-    services.notification_manager.start(args, session)
+    if tools.helpers.runtime.host_binder(args):
+        services.user_manager.start(args, session, unlocked_cb)
+        services.clipboard_manager.start(args)
+        services.notification_manager.start(args, session)
+    else:
+        # Rootless backend without host binder: the gbinder-based services have
+        # no service manager to talk to (see docs/rfc/rootless-backend.md).
+        logging.warning("Skipping host integration services: Android's binder "
+                        "is not reachable from the host with this backend")
+        if unlocked_cb:
+            unlocked_cb()
     service(args, mainloop)
+
+    if container_initializer is not None \
+            and container_initializer.worker_thread is not None:
+        container_initializer.worker_thread.kill()
+        container_initializer.worker_thread.join()
 
 def do_stop(args, looper):
     services.user_manager.stop(args)
@@ -117,12 +176,16 @@ def do_stop(args, looper):
 
 def stop(args):
     try:
-        tools.helpers.ipc.DBusSessionService().Stop()
+        tools.helpers.ipc.DBusSessionService(args).Stop()
     except dbus.DBusException:
-        stop_container(quit_session=True)
+        stop_container(args, quit_session=True)
 
-def stop_container(quit_session):
+def stop_container(args, quit_session):
+    if getattr(args, "_local_container", False):
+        from tools.actions import container_manager as _cm
+        _cm.stop(args, quit_session)
+        return
     try:
-        tools.helpers.ipc.DBusContainerService().Stop(quit_session)
+        tools.helpers.ipc.DBusContainerService(args).Stop(quit_session)
     except dbus.DBusException:
         pass

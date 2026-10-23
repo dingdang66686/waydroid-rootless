@@ -5,9 +5,9 @@ import dbus
 
 def get(args):
     try:
-        tools.helpers.ipc.DBusSessionService()
+        tools.helpers.ipc.DBusSessionService(args)
 
-        cm = tools.helpers.ipc.DBusContainerService()
+        cm = tools.helpers.ipc.DBusContainerService(args)
         session = cm.GetSession()
         if session["state"] == "FROZEN":
             cm.Unfreeze()
@@ -23,9 +23,9 @@ def get(args):
 
 def set(args):
     try:
-        tools.helpers.ipc.DBusSessionService()
+        tools.helpers.ipc.DBusSessionService(args)
 
-        cm = tools.helpers.ipc.DBusContainerService()
+        cm = tools.helpers.ipc.DBusContainerService(args)
         session = cm.GetSession()
         if session["state"] == "FROZEN":
             cm.Unfreeze()

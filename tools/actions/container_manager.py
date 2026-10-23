@@ -3,11 +3,9 @@
 
 import logging
 import os
-import glob
 import signal
 import tools.config
 from contextlib import suppress
-from shutil import which
 from tools import helpers
 from tools import services
 from tools import actions
@@ -15,6 +13,18 @@ import dbus
 import dbus.service
 import dbus.exceptions
 from gi.repository import GLib
+
+
+def _bus(args):
+    """Return the D-Bus the container daemons bind to.
+
+    The rootful LXC runtime owns id.waydro.Container on the system bus; a
+    rootless backend runs the same daemons on the session bus instead (see
+    helpers.runtime / docs/rfc/rootless-backend.md).
+    """
+    if helpers.runtime.uses_system_bus(args):
+        return dbus.SystemBus()
+    return dbus.SessionBus()
 
 class DbusContainerManager(dbus.service.Object):
     def __init__(self, looper, bus, object_path, args):
@@ -60,49 +70,10 @@ class DbusContainerManager(dbus.service.Object):
             raise RuntimeError("Waydroid is not initialized")
         try:
             session = self.args.session
-            session["state"] = helpers.lxc.status(self.args)
+            session["state"] = helpers.runtime.get(self.args).status(self.args)
             return session
         except AttributeError:
             return {}
-
-def set_permissions(args, perm_list=None, mode="777"):
-    def chmod(path, mode):
-        if os.path.exists(path):
-            command = ["chmod", mode, "-R", path]
-            tools.helpers.run.user(args, command, check=False)
-
-    # Nodes list
-    if not perm_list:
-        perm_list = [
-            "/dev/ashmem",
-
-            # sw_sync for HWC
-            "/dev/sw_sync",
-            "/sys/kernel/debug/sync/sw_sync",
-
-            # Media
-            "/dev/Vcodec",
-            "/dev/MTK_SMI",
-            "/dev/mdp_sync",
-            "/dev/mtk_cmdq",
-
-            # Graphics
-            "/dev/graphics",
-            "/dev/pvr_sync",
-            "/dev/ion",
-        ]
-
-        # DRM render nodes
-        perm_list.extend(glob.glob("/dev/dri/renderD*"))
-        # Framebuffers
-        perm_list.extend(glob.glob("/dev/fb*"))
-        # Videos
-        perm_list.extend(glob.glob("/dev/video*"))
-        # DMA-BUF Heaps
-        perm_list.extend(glob.glob("/dev/dma_heap/*"))
-
-    for path in perm_list:
-        chmod(path, mode)
 
 def start(args):
     mainloop = GLib.MainLoop()
@@ -115,11 +86,12 @@ def start(args):
     GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, sigint_handler, None)
     GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, sigint_handler, None)
 
-    initializer = actions.initializer.DbusInitializer(mainloop, dbus.SystemBus(), '/Initializer', args)
-    _container_manager = DbusContainerManager(mainloop, dbus.SystemBus(), '/ContainerManager', args)
+    bus = _bus(args)
+    initializer = actions.initializer.DbusInitializer(mainloop, bus, '/Initializer', args)
+    _container_manager = DbusContainerManager(mainloop, bus, '/ContainerManager', args)
 
     try:
-        _name = dbus.service.BusName("id.waydro.Container", dbus.SystemBus(), do_not_queue=True)
+        _name = dbus.service.BusName("id.waydro.Container", bus, do_not_queue=True)
     except dbus.exceptions.NameExistsException:
         logging.error("Container service is already running")
         return
@@ -130,26 +102,6 @@ def start(args):
         initializer.worker_thread.kill()
         initializer.worker_thread.join()
 
-prepared_drivers = False
-def prepare_drivers_once(args):
-    global prepared_drivers
-    if prepared_drivers:
-        return
-
-    # Load binder and ashmem drivers
-    cfg = tools.config.load(args)
-    if cfg["waydroid"]["vendor_type"] == "MAINLINE":
-        if helpers.drivers.probeBinderDriver(args) != 0:
-            logging.error("Failed to load Binder driver")
-        helpers.drivers.probeAshmemDriver(args)
-    helpers.drivers.loadBinderNodes(args)
-    set_permissions(args, [
-        "/dev/" + args.BINDER_DRIVER,
-        "/dev/" + args.VNDBINDER_DRIVER,
-        "/dev/" + args.HWBINDER_DRIVER
-    ], "666")
-    prepared_drivers = True
-
 def do_start(args, session):
     if not actions.initializer.is_initialized(args):
         raise RuntimeError("Waydroid is not initialized")
@@ -157,66 +109,18 @@ def do_start(args, session):
     if "session" in args:
         raise RuntimeError("Already tracking a session")
 
-    prepare_drivers_once(args)
+    backend = helpers.runtime.get(args)
+    backend.prepare_drivers(args)
 
     logging.info("Starting up container for a new session")
 
-    # Networking
-    command = [tools.config.tools_src +
-               "/data/scripts/waydroid-net.sh", "start"]
-    tools.helpers.run.user(args, command)
+    backend.setup_host_services(args)
+    backend.prepare_session(args, session)
+    backend.set_protocol(args)
 
-    # Sensors
-    if which("waydroid-sensord"):
-        tools.helpers.run.user(
-            args, ["waydroid-sensord", "/dev/" + args.HWBINDER_DRIVER], output="background")
-
-    # Cgroup hacks
-    if which("start"):
-        command = ["start", "cgroup-lite"]
-        tools.helpers.run.user(args, command, check=False)
-
-    # Keep schedtune around in case nesting is supported
-    if os.path.ismount("/sys/fs/cgroup/schedtune"):
-        try:
-            os.mkdir("/sys/fs/cgroup/schedtune/probe0")
-            os.mkdir("/sys/fs/cgroup/schedtune/probe0/probe1")
-        except OSError:
-            command = ["umount", "-l", "/sys/fs/cgroup/schedtune"]
-            tools.helpers.run.user(args, command, check=False)
-        finally:
-            if os.path.exists("/sys/fs/cgroup/schedtune/probe0/probe1"):
-                os.rmdir("/sys/fs/cgroup/schedtune/probe0/probe1")
-            if os.path.exists("/sys/fs/cgroup/schedtune/probe0"):
-                os.rmdir("/sys/fs/cgroup/schedtune/probe0")
-
-    #TODO: remove NFC hacks
-    if which("stop"):
-        command = ["stop", "nfcd"]
-        tools.helpers.run.user(args, command, check=False)
-    elif which("systemctl") and (tools.helpers.run.user(args, ["systemctl", "is-active", "-q", "nfcd"], check=False) == 0):
-        command = ["systemctl", "stop", "nfcd"]
-        tools.helpers.run.user(args, command, check=False)
-
-    # Set permissions
-    set_permissions(args)
-
-    # Create session-specific LXC config file
-    helpers.lxc.generate_session_lxc_config(args, session)
-    # Backwards compatibility
-    with open(tools.config.defaults["lxc"] + "/waydroid/config") as f:
-        if "config_session" not in f.read():
-            helpers.mount.bind(args, session["waydroid_data"],
-                               tools.config.defaults["data"])
-
-    # Mount rootfs
-    cfg = tools.config.load(args)
-    helpers.images.mount_rootfs(args, cfg["waydroid"]["images_path"], session)
-
-    helpers.protocol.set_aidl_version(args)
-
-    helpers.lxc.start(args)
-    services.hardware_manager.start(args)
+    backend.start(args, session)
+    if helpers.runtime.host_binder(args):
+        services.hardware_manager.start(args)
 
     args.session = session
 
@@ -227,40 +131,19 @@ def stop(args, quit_session=True):
     logging.info("Stopping container")
 
     try:
-        services.hardware_manager.stop(args)
-        status = helpers.lxc.status(args)
+        backend = helpers.runtime.get(args)
+
+        if helpers.runtime.host_binder(args):
+            services.hardware_manager.stop(args)
+
+        status = backend.status(args)
         if status != "STOPPED":
-            helpers.lxc.stop(args)
-            while helpers.lxc.status(args) != "STOPPED":
+            backend.stop(args)
+            while backend.status(args) != "STOPPED":
                 pass
 
-        # Networking
-        command = [tools.config.tools_src +
-                   "/data/scripts/waydroid-net.sh", "stop"]
-        tools.helpers.run.user(args, command, check=False)
-
-        #TODO: remove NFC hacks
-        if which("start"):
-            command = ["start", "nfcd"]
-            tools.helpers.run.user(args, command, check=False)
-        elif which("systemctl") and (tools.helpers.run.user(args, ["systemctl", "is-enabled", "-q", "nfcd"], check=False) == 0):
-            command = ["systemctl", "start", "nfcd"]
-            tools.helpers.run.user(args, command, check=False)
-
-        # Sensors
-        if which("waydroid-sensord"):
-            command = ["pidof", "waydroid-sensord"]
-            pid = tools.helpers.run.user(args, command, check=False, output_return=True).strip()
-            if pid:
-                command = ["kill", "-9", pid]
-                tools.helpers.run.user(args, command, check=False)
-
-        # Umount rootfs
-        helpers.images.umount_rootfs(args)
-
-        # Backwards compatibility
-        with suppress(Exception):
-            helpers.mount.umount_all(args, tools.config.defaults["data"])
+        backend.teardown_host_services(args)
+        backend.teardown_session(args)
 
         if "session" in args:
             if quit_session:
@@ -271,26 +154,51 @@ def stop(args, quit_session=True):
     except Exception as e:
         logging.debug("Error while stopping container: %s", e)
 
+def stop_cli(args):
+    """`waydroid container stop` from the CLI.
+
+    Prefer the daemon (standalone or merged into the session): it stops the
+    container *and* terminates the session it is tracking.  Fall back to a
+    direct stop when no daemon is listening.
+    """
+    try:
+        helpers.ipc.DBusContainerService(args).Stop(True)
+        return
+    except dbus.DBusException:
+        pass
+    stop(args)
+
+
 def restart(args):
-    status = helpers.lxc.status(args)
+    backend = helpers.runtime.get(args)
+    status = backend.status(args)
+    if status == "FROZEN":
+        backend.unfreeze(args)
+        while backend.status(args) == "FROZEN":
+            pass
+        status = backend.status(args)
     if status == "RUNNING":
-        helpers.lxc.stop(args)
-        helpers.lxc.start(args)
+        backend.stop(args)
+        backend.start(args, getattr(args, "session", None))
     else:
         logging.error("WayDroid container is {}".format(status))
 
 def freeze(args):
-    status = helpers.lxc.status(args)
+    backend = helpers.runtime.get(args)
+    status = backend.status(args)
     if status == "RUNNING":
-        helpers.lxc.freeze(args)
-        while helpers.lxc.status(args) == "RUNNING":
+        backend.freeze(args)
+        while backend.status(args) == "RUNNING":
             pass
     else:
         logging.error("WayDroid container is {}".format(status))
 
 def unfreeze(args):
-    status = helpers.lxc.status(args)
+    backend = helpers.runtime.get(args)
+    status = backend.status(args)
     if status == "FROZEN":
-        helpers.lxc.unfreeze(args)
-        while helpers.lxc.status(args) == "FROZEN":
+        backend.unfreeze(args)
+        while backend.status(args) == "FROZEN":
             pass
+    else:
+        logging.error("WayDroid container is {}".format(status))

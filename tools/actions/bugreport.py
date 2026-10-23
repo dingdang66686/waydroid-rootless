@@ -15,13 +15,29 @@ import time
 WAYDROID = sys.argv[0]
 TARBALL = "waydroid-bugreport.tar.xz"
 
-def logcat(output_path):
+def logcat(args, output_path):
+    cmd = [WAYDROID, "logcat"]
+    if tools.helpers.runtime.needs_root(args):
+        cmd = ["sudo"] + cmd
     with open(output_path, "w+") as fd:
-        return subprocess.Popen(["sudo", WAYDROID, "logcat"], stdout=fd, stderr=sys.stderr, stdin=None)
+        return subprocess.Popen(cmd, stdout=fd, stderr=sys.stderr, stdin=None)
 
-def dmesg(params, output_path):
+def dmesg(args, params, output_path):
+    cmd = ["dmesg", "-T"] + params
+    if os.geteuid() != 0:
+        if not shutil.which("sudo"):
+            with open(output_path, "w") as fd:
+                fd.write("dmesg skipped: sudo is not available\n")
+            return None
+        if subprocess.run(["sudo", "-n", "true"], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode != 0:
+            with open(output_path, "w") as fd:
+                fd.write("dmesg skipped: host kernel logs require root "
+                         "(passwordless sudo is not available)\n")
+            return None
+        cmd = ["sudo", "-n"] + cmd
     with open(output_path, "w+") as fd:
-        return subprocess.Popen(["sudo", "dmesg", "-T"] + params, stdout=fd, stderr=fd, stdin=None)
+        return subprocess.Popen(cmd, stdout=fd, stderr=fd, stdin=None)
 
 def waydroid_session(output_path):
     with open(output_path, "w+") as fd:
@@ -59,25 +75,16 @@ def bugreport(args):
 
     print("""\
 The following information will be collected:
-  - System kernel logs (kmsg)
+  - System kernel logs (dmesg; optional, requires root)
   - Android system and user logs (logcat)
-  - Waydroid container manager logs (/var/lib/waydroid/waydroid.log)
-  - Waydroid configuration files (/var/lib/waydroid/*)
+  - Waydroid container manager logs (<work>/waydroid.log)
+  - Waydroid configuration files (<work>/*)
 
 The information will be stored on your machine.
 
-Please authenticate as administrator in order to read system logs.
+Host kernel logs are optional; if passwordless sudo is unavailable they are
+skipped and the rest of the report is still collected.
 """)
-
-    try:
-        subprocess.run(["sudo", "-v"], check=True)
-        print()
-    except FileNotFoundError:
-        print("The 'sudo' command is not available. Cannot read system logs.")
-        return
-    except subprocess.CalledProcessError:
-        print("Authentication failed or was cancelled.")
-        return
 
     procs = []
     logfiles = []
@@ -88,7 +95,7 @@ Please authenticate as administrator in order to read system logs.
 
     session = None
     try:
-        session = tools.helpers.ipc.DBusContainerService().GetSession()
+        session = tools.helpers.ipc.DBusContainerService(args).GetSession()
     except dbus.DBusException:
         pass
 
@@ -97,7 +104,7 @@ Please authenticate as administrator in order to read system logs.
         procs.append(waydroid_session(logfile("session.txt")))
         sleep_progress(10)
         try:
-            session = tools.helpers.ipc.DBusContainerService().GetSession()
+            session = tools.helpers.ipc.DBusContainerService(args).GetSession()
         except dbus.DBusException:
             pass
 
@@ -106,13 +113,14 @@ Please authenticate as administrator in order to read system logs.
 \033[1mPlease try to reproduce the problem now.\033[0m\n\
 Waydroid will collect logs for up to 5 minutes. You may interrupt this operation earlier.\n\
 ")
-        procs.append(logcat(logfile("logcat.txt")))
-        procs.append(dmesg(["-w"], logfile("dmesg.txt")))
+        procs.append(logcat(args, logfile("logcat.txt")))
+        procs.append(dmesg(args, ["-w"], logfile("dmesg.txt")))
         sleep_progress(5 * 60)
     else:
         print("Session did not start\n")
-        procs.append(dmesg([], logfile("dmesg.txt")))
+        procs.append(dmesg(args, [], logfile("dmesg.txt")))
 
+    procs = [p for p in procs if p is not None]
     for p in procs:
         p.terminate()
     for p in procs:
@@ -123,11 +131,11 @@ Waydroid will collect logs for up to 5 minutes. You may interrupt this operation
     try:
         with tarfile.open(TARBALL, "w:xz", preset=9) as tar:
             files = [
-                "/var/lib/waydroid/waydroid.log",
-                "/var/lib/waydroid/waydroid.cfg",
-                "/var/lib/waydroid/waydroid_base.prop",
-                "/var/lib/waydroid/waydroid.prop",
-                "/var/lib/waydroid/lxc",
+                args.work + "/waydroid.log",
+                args.work + "/waydroid.cfg",
+                args.work + "/waydroid_base.prop",
+                args.work + "/waydroid.prop",
+                args.work + "/lxc",
             ] + logfiles
 
             for f in files:

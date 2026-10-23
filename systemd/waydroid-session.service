@@ -1,0 +1,15 @@
+[Unit]
+Description=Waydroid (rootless podman)
+Documentation=https://github.com/waydroid/waydroid
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=WAYDROID_BACKEND=podman
+ExecStart=/usr/local/bin/waydroid session start
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
