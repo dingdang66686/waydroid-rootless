@@ -2,13 +2,24 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Local rootfs overlay -> derived OCI image, checked at session start.
 
-The public image stays clean.  A user may keep a local overlay tree in
-``$WORK/overlay`` (or ``podman_overlay_path``)::
+The public image stays clean.  The primary layout matches upstream Waydroid's
+persistent overlay lowerdir in ``$WORK/overlay`` (or ``podman_overlay_path``)::
 
     overlay/
-      rootfs/              files added/replaced under /
+      system/...           files added/replaced under /system
+      vendor/...           files added/replaced under /vendor
+      ...                  other rootfs-relative paths
+
+Extensions (ignored by an upstream LXC runtime, so an existing overlay tree
+keeps working)::
+
       props/               property fragments merged into rootfs files
       remove.list          optional root-relative paths to delete
+      rootfs/              legacy/self-contained tree from the first iteration
+
+Full-file overrides such as ``overlay/system/build.prop`` follow upstream
+overlay semantics; ``props/`` is a convenience merge on top.  ``mount_overlays
+= False`` (the upstream switch) disables the whole feature.
 
 On every container start the overlay fingerprint is compared with the last
 build stamp.  If the overlay, the base image, or the derived tag changed, the
@@ -34,6 +45,7 @@ from datetime import datetime, timezone
 
 SCHEMA = 1
 DEFAULT_IMAGE_PREFIX = "localhost/waydroid-overlay"
+METADATA_TOP = ("props", "remove.list")
 
 
 def _image_exists(image):
@@ -72,10 +84,44 @@ def _overlay_image(args, cfg, base):
     return "{}:{}".format(DEFAULT_IMAGE_PREFIX, tag)
 
 
+def _tree(path):
+    """Upstream uses $WORK/overlay itself as the lowerdir.  Keep accepting the
+    earlier rootfs/ child as a self-contained tree, but prefer upstream."""
+    legacy = os.path.join(path, "rootfs")
+    if os.path.isdir(legacy):
+        return legacy, True
+    return path, False
+
+
+def _has_payload(root, legacy):
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        top = os.path.realpath(dirpath) == os.path.realpath(root)
+        for name in list(dirnames):
+            if os.path.islink(os.path.join(dirpath, name)):
+                return True
+        if not legacy and top:
+            filenames = [name for name in filenames if name not in METADATA_TOP]
+        if filenames:
+            return True
+    return False
+
+
 def _active(path):
-    return (os.path.isdir(os.path.join(path, "rootfs"))
-            or os.path.isdir(os.path.join(path, "props"))
-            or os.path.isfile(os.path.join(path, "remove.list")))
+    tree, legacy = _tree(path)
+    if _has_payload(tree, legacy):
+        return True
+    props = os.path.join(path, "props")
+    if os.path.isdir(props):
+        for _dirpath, _dirnames, filenames in os.walk(props, followlinks=False):
+            if filenames:
+                return True
+    remove = os.path.join(path, "remove.list")
+    if os.path.isfile(remove):
+        with open(remove, encoding="utf-8", errors="ignore") as f:
+            if any(line.strip() and not line.lstrip().startswith("#")
+                   for line in f):
+                return True
+    return False
 
 
 def _hash_file(h, path):
@@ -84,14 +130,16 @@ def _hash_file(h, path):
             h.update(chunk)
 
 
-def _hash_tree(h, root, prefix):
-    def walk(directory, rel):
+def _hash_tree(h, root, prefix, exclude_top=()):
+    def walk(directory, rel, top):
         try:
             entries = sorted(os.scandir(directory), key=lambda e: e.name)
         except OSError:
             return
         for entry in entries:
             name = entry.name
+            if top and name in exclude_top:
+                continue
             entry_rel = rel + "/" + name if rel else name
             st = entry.stat(follow_symlinks=False)
             h.update(entry_rel.encode())
@@ -104,7 +152,7 @@ def _hash_tree(h, root, prefix):
                 h.update(b"\0")
             elif entry.is_dir(follow_symlinks=False):
                 h.update(b"D\0")
-                walk(entry.path, entry_rel)
+                walk(entry.path, entry_rel, False)
             elif entry.is_file(follow_symlinks=False):
                 h.update(b"F\0")
                 h.update(str(st.st_size).encode())
@@ -112,22 +160,24 @@ def _hash_tree(h, root, prefix):
                 _hash_file(h, entry.path)
             else:
                 h.update(b"X\0")
-    walk(root, prefix)
+    walk(root, prefix, True)
 
 
 def _fingerprint(path):
-    rootfs = os.path.join(path, "rootfs")
+    if not _active(path):
+        return None
+    tree, legacy = _tree(path)
     props = os.path.join(path, "props")
     remove = os.path.join(path, "remove.list")
-    if not (os.path.isdir(rootfs) or os.path.isdir(props)
-            or os.path.isfile(remove)):
-        return None
     h = hashlib.sha256()
-    h.update(b"podman-overlay-v1\0")
-    for prefix, root in (("rootfs", rootfs), ("props", props)):
-        if os.path.isdir(root):
-            h.update(prefix.encode() + b"\0")
-            _hash_tree(h, root, prefix)
+    h.update(b"podman-overlay-v2\0")
+    if _has_payload(tree, legacy):
+        prefix = "rootfs" if legacy else "overlay"
+        h.update(prefix.encode() + b"\0")
+        _hash_tree(h, tree, prefix, () if legacy else METADATA_TOP)
+    if os.path.isdir(props):
+        h.update(b"props\0")
+        _hash_tree(h, props, "props")
     if os.path.isfile(remove):
         h.update(b"remove.list\0")
         _hash_file(h, remove)
@@ -180,13 +230,15 @@ def _copy_file(src, dst):
     shutil.copymode(src, dst)
 
 
-def _apply_tree(src, dst, root):
+def _apply_tree(src, dst, root, exclude_top=(), top=True):
     if not os.path.isdir(src):
         return
     try:
         entries = sorted(os.scandir(src), key=lambda e: e.name)
     except OSError:
         return
+    if top and exclude_top:
+        entries = [e for e in entries if e.name not in exclude_top]
     opaque = any(e.name == ".wh..wh..opq" for e in entries)
     if opaque:
         if os.path.realpath(dst) == os.path.realpath(root):
@@ -215,7 +267,7 @@ def _apply_tree(src, dst, root):
                                           and not os.path.isdir(target)):
                 _remove_path(target)
             os.makedirs(target, exist_ok=True)
-            _apply_tree(entry.path, target, root)
+            _apply_tree(entry.path, target, root, top=False)
             shutil.copymode(entry.path, target)
         elif entry.is_file(follow_symlinks=False):
             _copy_file(entry.path, target)
@@ -384,8 +436,9 @@ def _build(args, overlay, base, image, fingerprint, base_id):
     old_id = _image_id(image) if _image_exists(image) else None
     try:
         _extract_base(base, root, tmp)
+        tree, legacy = _tree(overlay)
         _apply_remove_list(root, overlay)
-        _apply_tree(os.path.join(overlay, "rootfs"), root, root)
+        _apply_tree(tree, root, root, () if legacy else METADATA_TOP)
         _apply_props(root, overlay)
         _fix_permissions(root)
         logging.info("[overlay] writing %s", tar)
@@ -420,6 +473,10 @@ def ensure(args, cfg):
     An active overlay that cannot be rebuilt is a hard error: silently booting
     the base image would lose the user's compatibility layer.
     """
+    if str(cfg["waydroid"].get("mount_overlays", "True")).lower() not in ("true", "1"):
+        logging.info("[overlay] mount_overlays is disabled; using base image")
+        return None
+
     path = _overlay_path(args, cfg)
     if not _active(path):
         return None
