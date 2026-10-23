@@ -84,13 +84,15 @@ defaults = {
     #                      --userns= value
     #   podman_pasta_options - extra comma-separated pasta options appended to
     #                      the --network string
-    #   podman_overlay_path - local overlay directory checked at every
+    #   podman_overlay_path - local file-tree overlay checked at every
     #                      container start (default: $WORK/overlay).  It uses
     #                      upstream's lowerdir layout: system/, vendor/ and
-    #                      other rootfs-relative paths.  props/ and remove.list
-    #                      are optional extensions.  The result is imported as
-    #                      podman_overlay_image.  mount_overlays=False disables
-    #                      it; empty/absent means the normal public-image path.
+    #                      other rootfs-relative paths; only additions and
+    #                      replacements are supported.  The overlay is built as
+    #                      a COPY layer on podman_image (base layers shared) and
+    #                      tagged as podman_overlay_image.  mount_overlays=False
+    #                      disables it; empty/absent means the normal public
+    #                      image path.
     #   podman_overlay_image - derived image tag for the local overlay
     #                      (default: localhost/waydroid-overlay:<base tag>).
     #                      It must differ from podman_image.
