@@ -497,7 +497,7 @@ unworkable.**
   `overlay` (with `userxattr`), not `fuse-overlayfs`. Native rootless overlay
   needs kernel >= 5.13. This is host storage state, not a backend choice. Extracting `system.img`/`vendor.img`, the `a+rX` fix-up and the
   `.rc` overrides all happen in the build system
-  (`waydroid-rootless-image/build-rootfs.sh`, see `image/BUILD.md`), not at
+  (`waydroid-rootless-image/build-rootfs.sh`, see [image/BUILD.md](https://github.com/dingdang66686/waydroid-rootless-image/blob/main/BUILD.md)), not at
   run time.
 * **`/data` is a named podman volume** (`podman_data_volume`, default
   `waydroid-data`) mounted at `/data`. It survives `podman rm`; wipe it with
@@ -943,7 +943,7 @@ be distributed.
 
 > The supported rootfs builder in this workspace is `image/build-rootfs.sh`
 > (input: raw/sparse `system.img` + `vendor.img`; output: patched `rootfs/` +
-> `manifest.json` (+ optional `rootfs.tar`), see `image/BUILD.md`).  The
+> `manifest.json` (+ optional `rootfs.tar`), see [image/BUILD.md](https://github.com/dingdang66686/waydroid-rootless-image/blob/main/BUILD.md)).  The
 > `build.sh`/Containerfile flow above is the optional ARM-layering reference;
 > libndk is a user overlay, not part of the rootfs build.
 
