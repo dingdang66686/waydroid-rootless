@@ -2299,10 +2299,10 @@ index 0000000..de93d14
 +    _lxc.logcat(args)
 diff --git a/tools/helpers/runtime/overlay.py b/tools/helpers/runtime/overlay.py
 new file mode 100644
-index 0000000..747f374
+index 0000000..1583a41
 --- /dev/null
 +++ b/tools/helpers/runtime/overlay.py
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,315 @@
 +# Copyright 2026 The Waydroid contributors
 +# SPDX-License-Identifier: GPL-3.0-or-later
 +"""Local file-tree overlay -> derived OCI image, checked at session start.
@@ -2381,6 +2381,23 @@ index 0000000..747f374
 +    else:
 +        tag = "latest"
 +    return "{}:{}".format(DEFAULT_IMAGE_PREFIX, tag)
++
++
++def _validate_tree(path):
++    """Reject the removed extension syntax instead of silently layering it."""
++    for name, label in (("props", "props/ property merging"),
++                        ("rootfs", "the legacy rootfs/ layout"),
++                        ("remove.list", "remove.list deletion support")):
++        if os.path.lexists(os.path.join(path, name)):
++            raise RuntimeError(
++                "{} is not supported; use a basic file tree with full files "
++                "under system/ and vendor/".format(label))
++    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
++        for name in dirnames + filenames:
++            if name == ".wh..wh..opq" or name.startswith(".wh."):
++                raise RuntimeError(
++                    "whiteout entries are not supported; only basic file-tree "
++                    "overlays are available")
 +
 +
 +def _active(path):
@@ -2567,6 +2584,8 @@ index 0000000..747f374
 +        return None
 +
 +    path = _overlay_path(args, cfg)
++    if os.path.isdir(path):
++        _validate_tree(path)
 +    if not _active(path):
 +        return None
 +
