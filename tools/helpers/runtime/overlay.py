@@ -369,7 +369,7 @@ def _stamp_valid(stamp, fingerprint, overlay, base, base_id, image):
         if stamp.get(key) != expected:
             return False
     image_id = stamp.get("image_id")
-    if not image_id or not _image_exists(image):
+    if not image_id or image_id == base_id or not _image_exists(image):
         return False
     return _image_id(image) == image_id
 
@@ -392,7 +392,7 @@ def _build(args, overlay, base, image, fingerprint, base_id):
         _write_tar(root, tar)
         _import(tar, image)
         image_id = _image_id(image)
-        if old_id and old_id != image_id:
+        if old_id and old_id != image_id and old_id != base_id:
             # Drop the previous derived image when possible; a container
             # still using it makes podman refuse, which is fine.
             subprocess.run(["podman", "rmi", old_id],
