@@ -1437,10 +1437,13 @@ The public image stays clean; a user may keep a private overlay tree in
 `$WORK/overlay` (configurable with `podman_overlay_path`).  The layout is:
 
 ```
-overlay/
-  rootfs/              files added/replaced under /
-  props/               property fragments merged into rootfs files
-  remove.list          optional root-relative paths to delete
+$WORK/overlay/         # upstream lowerdir layout
+  system/...           files added/replaced under /system
+  vendor/...           files added/replaced under /vendor
+  ...                  other rootfs-relative paths
+  props/               optional extension: property fragments
+  remove.list          optional extension: root-relative paths to delete
+  rootfs/              legacy self-contained layout from the first iteration
 ```
 
 `runtime/overlay.py` runs from `prepare_session()` and again from `start()`
@@ -1461,6 +1464,14 @@ configured `podman_image` still points at the clean base, so `upgrade`/`init`
 and `is_initialized()` keep working.  The derived image is local only; nothing
 is pushed.  A failed rebuild is fatal rather than silently booting without the
 layer, because the overlay is usually the user's compatibility layer.
+
+The tree is the persistent half of upstream's runtime overlay: `$WORK/overlay`
+is its lowerdir, it survives `upgrade`/`init`, and `mount_overlays = False`
+disables it.  The podman backend does not implement upstream's
+`overlay_rw`/`overlay_work` upperdir: the container rootfs layer is ephemeral
+and `/data` is the persistent session state.  `props/`, `remove.list`, `.wh.`
+whiteouts, and the legacy `rootfs/` child are local extensions; an upstream
+overlay tree containing only `system/` and `vendor/` works unchanged.
 
 This is deliberately separate from the image repository: the public CI does not
 read `overlay/`, and proprietary files (for example the ARM translation layer)

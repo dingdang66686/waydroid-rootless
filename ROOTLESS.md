@@ -84,22 +84,30 @@ The application supports a private local overlay, checked at every container
 start (including `container restart`; there is no watcher):
 
 ```text
-$WORK/overlay/
-  rootfs/              files added/replaced under /
-    system/...
-    vendor/...
-  props/               property fragments merged into rootfs files
+$WORK/overlay/           # upstream lowerdir layout
+  system/...             files added/replaced under /system
+  vendor/...             files added/replaced under /vendor
+  ...                    any other rootfs-relative path
+  props/                 optional extension: property fragments
     system/build.prop
     vendor/build.prop
     vendor/odm/etc/build.prop
-  remove.list          optional root-relative paths to delete
+  remove.list            optional extension: root-relative paths to delete
+  rootfs/                legacy self-contained layout from the first iteration
 ```
+
+The tree follows upstream Waydroid's persistent `$WORK/overlay` lowerdir:
+`system/`, `vendor/`, and the rest are rootfs-relative, and `mount_overlays =
+False` disables it.  `props/`, `remove.list`, `.wh.` whiteouts, and the legacy
+`rootfs/` child are local extensions; an upstream overlay tree without them
+works unchanged.  `overlay_rw`/`overlay_work` are not used by the podman backend
+(its container layer is ephemeral); `/data` remains the persistent session state.
 
 On start the backend hashes the active overlay inputs and compares the result
 with `$WORK/podman-overlay.stamp`, together with the base image ID.  If nothing
 changed it reuses the derived image.  Otherwise it exports the configured
-`podman_image` without booting it, applies `remove.list` / `rootfs/` (including
-`.wh.` whiteouts) / `props/`, fixes world-read permissions, and imports
+`podman_image` without booting it, applies `remove.list` / the overlay tree
+(including `.wh.` whiteouts) / `props/`, fixes world-read permissions, and imports
 `podman_overlay_image` (default `localhost/waydroid-overlay:<base tag>`).  The
 configured `podman_image` remains the clean base; only the running session uses
 the derived tag.  A failed rebuild is a hard error instead of silently booting
