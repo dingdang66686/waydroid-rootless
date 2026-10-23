@@ -78,6 +78,46 @@ The image build is in
 (see `BUILD.md` there); its GitHub Actions workflow publishes
 `ghcr.io/dingdang66686/waydroid-rootless-image:13`.
 
+## Local overlay (startup rebuild)
+
+The application supports a private local overlay, checked at every container
+start (including `container restart`; there is no watcher):
+
+```text
+$WORK/overlay/
+  rootfs/              files added/replaced under /
+    system/...
+    vendor/...
+  props/               property fragments merged into rootfs files
+    system/build.prop
+    vendor/build.prop
+    vendor/odm/etc/build.prop
+  remove.list          optional root-relative paths to delete
+```
+
+On start the backend hashes the active overlay inputs and compares the result
+with `$WORK/podman-overlay.stamp`, together with the base image ID.  If nothing
+changed it reuses the derived image.  Otherwise it exports the configured
+`podman_image` without booting it, applies `remove.list` / `rootfs/` (including
+`.wh.` whiteouts) / `props/`, fixes world-read permissions, and imports
+`podman_overlay_image` (default `localhost/waydroid-overlay:<base tag>`).  The
+configured `podman_image` remains the clean base; only the running session uses
+the derived tag.  A failed rebuild is a hard error instead of silently booting
+without the compatibility layer.
+
+Optional config keys:
+
+```ini
+podman_overlay_path = /home/you/.local/state/waydroid/overlay
+podman_overlay_image = localhost/waydroid-overlay:13
+```
+
+The overlay is flattened into a new local image; it is not a runtime overlay,
+so the runtime contract is unchanged.  `overlay/` and the derived image are
+local/private: do not commit proprietary prebuilts (for example the ARM
+translation layer) or push a derived image containing them.  The public image
+and its CI remain clean and never read this directory.
+
 ## Image-mode commands
 
 - `waydroid init`: pull `podman_image_remote`, tag it as `podman_image`, prepare

@@ -1430,3 +1430,41 @@ per-user service; a failed pull leaves the running container untouched.
 same pull/tag, runs `setup_host()` (named volume + base props) and starts the
 user service; a failed pull leaves any running container untouched.  The
 `/data` volume is preserved.
+
+### C.8 Local overlay rebuild at session start
+
+The public image stays clean; a user may keep a private overlay tree in
+`$WORK/overlay` (configurable with `podman_overlay_path`).  It uses the same
+shape as the image-side prototype:
+
+```
+overlay/
+  rootfs/              files added/replaced under /
+  props/               property fragments merged into rootfs files
+  remove.list          optional root-relative paths to delete
+```
+
+`runtime/overlay.py` runs from `prepare_session()` and again from `start()`
+(the latter covers `container restart`, which bypasses `prepare_session`), so
+the check happens at every container start, not on a file watcher.  It hashes
+the active overlay inputs (paths, modes, symlink targets, file contents,
+`remove.list`) and records the result together with the base image ID and the
+derived image ID in `$WORK/podman-overlay.stamp`.  When both the fingerprint and
+the base image are unchanged and the derived image still exists, it returns the
+cached derived tag; otherwise it exports the base image without booting it
+(`podman create` + `podman export`), applies the overlay on the host, removes
+the container-only `/dev` entries and `/run/.containerenv`, and re-imports the
+flattened tar as `podman_overlay_image` (default
+`localhost/waydroid-overlay:<base tag>`).  A lock serialises concurrent starts.
+
+The runtime image override is kept in memory (`args.podman_overlay_image`); the
+configured `podman_image` still points at the clean base, so `upgrade`/`init`
+and `is_initialized()` keep working.  The derived image is local only; nothing
+is pushed.  A failed rebuild is fatal rather than silently booting without the
+layer, because the overlay is usually the user's compatibility layer.
+
+This is deliberately separate from the image repository: the public CI does not
+read `overlay/`, and proprietary files (for example the ARM translation layer)
+never enter the public tree or GHCR package.  The overlay is flattened into the
+derived image rather than being a runtime overlay, so the runtime contract is
+still one OCI image plus the named `/data` volume.

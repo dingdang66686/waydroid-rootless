@@ -69,6 +69,8 @@ podman_image = $IMAGE
 podman_image_remote = $IMAGE
 podman_data_volume = $VOLUME
 podman_binderfs = container
+podman_overlay_path = $WORK/overlay
+podman_overlay_image = localhost/waydroid-overlay:13
 
 [properties]
 CFG_EOF
