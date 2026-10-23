@@ -1,0 +1,3475 @@
+diff --git a/systemd/waydroid-session.service b/systemd/waydroid-session.service
+new file mode 100644
+index 0000000..14e9632
+--- /dev/null
++++ b/systemd/waydroid-session.service
+@@ -0,0 +1,15 @@
++[Unit]
++Description=Waydroid (rootless podman)
++Documentation=https://github.com/waydroid/waydroid
++After=graphical-session.target
++PartOf=graphical-session.target
++
++[Service]
++Type=simple
++Environment=WAYDROID_BACKEND=podman
++ExecStart=/usr/local/bin/waydroid session start
++Restart=on-failure
++RestartSec=3
++
++[Install]
++WantedBy=default.target
+diff --git a/tools/__init__.py b/tools/__init__.py
+index 095594c..22cac99 100644
+--- a/tools/__init__.py
++++ b/tools/__init__.py
+@@ -16,6 +16,12 @@ from .helpers import logging as tools_logging
+ 
+ def prep_args(args):
+     args.cache = {}
++    # WAYDROID_WORK moves the whole state directory (config, images, rootfs,
++    # overlays, data, ...) somewhere else.  Needed for rootless backends, which
++    # cannot write to the root-owned /var/lib/waydroid default.
++    work = os.environ.get("WAYDROID_WORK")
++    if work:
++        config.rebase(work)
+     args.work = config.defaults["work"]
+     args.config = args.work + "/waydroid.cfg"
+     args.log = args.work + "/waydroid.log"
+@@ -23,10 +29,13 @@ def prep_args(args):
+     args.timeout = 1800
+ 
+ def main():
+-    def actionNeedRoot(action):
+-        if os.geteuid() != 0:
+-            raise RuntimeError(
+-                "Action \"{}\" needs root access".format(action))
++    def actionNeedRoot(args, action):
++        # The rootless podman backend does not need host root for anything the
++        # CLI drives; the backend itself declares that (see helpers.runtime).
++        if os.geteuid() == 0 or not helpers.runtime.needs_root(args):
++            return
++        raise RuntimeError(
++            "Action \"{}\" needs root access".format(action))
+ 
+     # Wrap everything to display nice error messages
+     args = None
+@@ -38,8 +47,16 @@ def main():
+         if os.geteuid() == 0:
+             if not os.path.exists(args.work):
+                 os.mkdir(args.work)
+-        elif not os.path.exists(args.log):
+-            args.log = "/tmp/tools.log"
++        else:
++            # Rootless: the work dir lives under the user's home, so create it
++            # (and fall back to /tmp for the log if that is not possible).
++            if not os.path.exists(args.work):
++                try:
++                    os.makedirs(args.work, exist_ok=True)
++                except OSError:
++                    pass
++            if not os.path.exists(args.log):
++                args.log = "/tmp/tools.log"
+ 
+         tools_logging.init(args)
+ 
+@@ -58,10 +75,10 @@ def main():
+             if args.client:
+                 actions.remote_init_client(args)
+             else:
+-                actionNeedRoot(args.action)
++                actionNeedRoot(args, args.action)
+                 actions.init(args)
+         elif args.action == "upgrade":
+-            actionNeedRoot(args.action)
++            actionNeedRoot(args, args.action)
+             actions.upgrade(args)
+         elif args.action == "session":
+             if args.subaction == "start":
+@@ -72,11 +89,11 @@ def main():
+                 logging.info(
+                     "Run waydroid {} -h for usage information.".format(args.action))
+         elif args.action == "container":
+-            actionNeedRoot(args.action)
++            actionNeedRoot(args, args.action)
+             if args.subaction == "start":
+                 actions.container_manager.start(args)
+             elif args.subaction == "stop":
+-                actions.container_manager.stop(args)
++                actions.container_manager.stop_cli(args)
+             elif args.subaction == "restart":
+                 actions.container_manager.restart(args)
+             elif args.subaction == "freeze":
+@@ -109,11 +126,11 @@ def main():
+                 logging.info(
+                     "Run waydroid {} -h for usage information.".format(args.action))
+         elif args.action == "shell":
+-            actionNeedRoot(args.action)
+-            helpers.lxc.shell(args)
++            actionNeedRoot(args, args.action)
++            helpers.runtime.get(args).shell(args)
+         elif args.action == "logcat":
+-            actionNeedRoot(args.action)
+-            helpers.lxc.logcat(args)
++            actionNeedRoot(args, args.action)
++            helpers.runtime.get(args).logcat(args)
+         elif args.action == "show-full-ui":
+             actions.app_manager.showFullUI(args)
+         elif args.action == "first-launch":
+diff --git a/tools/actions/app_manager.py b/tools/actions/app_manager.py
+index 9fceb11..335f103 100644
+--- a/tools/actions/app_manager.py
++++ b/tools/actions/app_manager.py
+@@ -13,24 +13,37 @@ import dbus
+ 
+ def install(args):
+     try:
+-        tools.helpers.ipc.DBusSessionService()
++        tools.helpers.ipc.DBusSessionService(args)
+ 
+-        cm = tools.helpers.ipc.DBusContainerService()
++        cm = tools.helpers.ipc.DBusContainerService(args)
+         session = cm.GetSession()
+         if session["state"] == "FROZEN":
+             cm.Unfreeze()
+ 
+-        tmp_dir = tools.config.session_defaults["waydroid_data"] + "/waydroid_tmp"
+-        if not os.path.exists(tmp_dir):
+-            os.makedirs(tmp_dir)
++        backend = tools.helpers.runtime.get(args)
++        push = getattr(backend, "push_apk", None)
++        if push:
++            apk_path = push(args, args.PACKAGE)
++        else:
++            tmp_dir = (session.get("waydroid_data")
++                       or tools.config.session_defaults["waydroid_data"]) + "/waydroid_tmp"
++            if not os.path.exists(tmp_dir):
++                os.makedirs(tmp_dir)
++            shutil.copyfile(args.PACKAGE, tmp_dir + "/base.apk")
++            apk_path = "/data/waydroid_tmp/base.apk"
+ 
+-        shutil.copyfile(args.PACKAGE, tmp_dir + "/base.apk")
+         platformService = IPlatform.get_service(args)
+         if platformService:
+-            platformService.installApp("/data/waydroid_tmp/base.apk")
++            platformService.installApp(apk_path)
+         else:
+             logging.error("Failed to access IPlatform service")
+-        os.remove(tmp_dir + "/base.apk")
++
++        if push:
++            remove = getattr(backend, "remove_apk", None)
++            if remove:
++                remove(args, apk_path)
++        else:
++            os.remove(tmp_dir + "/base.apk")
+ 
+         if session["state"] == "FROZEN":
+             cm.Freeze()
+@@ -39,20 +52,28 @@ def install(args):
+ 
+ def remove(args):
+     try:
+-        tools.helpers.ipc.DBusSessionService()
++        tools.helpers.ipc.DBusSessionService(args)
+ 
+-        cm = tools.helpers.ipc.DBusContainerService()
++        cm = tools.helpers.ipc.DBusContainerService(args)
+         session = cm.GetSession()
+         if session["state"] == "FROZEN":
+             cm.Unfreeze()
+ 
+         platformService = IPlatform.get_service(args)
++        ret = None
+         if platformService:
+             ret = platformService.removeApp(args.PACKAGE)
+-            if ret != 0:
+-                logging.error("Failed to uninstall package: {}".format(args.PACKAGE))
+-        else:
+-            logging.error("Failed to access IPlatform service")
++        if ret != 0:
++            # IPlatform.removeApp returns -1 on some images even though
++            # PackageManager can uninstall the package.
++            fallback = getattr(tools.helpers.runtime.get(args),
++                               "remove_app", None)
++            if fallback is not None and fallback(args, args.PACKAGE) == 0:
++                ret = 0
++                logging.info("Uninstalled {} via the runtime shell".format(
++                    args.PACKAGE))
++        if ret != 0:
++            logging.error("Failed to uninstall package: {}".format(args.PACKAGE))
+ 
+         if session["state"] == "FROZEN":
+             cm.Freeze()
+@@ -61,9 +82,9 @@ def remove(args):
+ 
+ def maybeLaunchLater(args, launchNow):
+     try:
+-        tools.helpers.ipc.DBusSessionService()
++        tools.helpers.ipc.DBusSessionService(args)
+         try:
+-            tools.helpers.ipc.DBusContainerService().Unfreeze()
++            tools.helpers.ipc.DBusContainerService(args).Unfreeze()
+         except Exception:
+             logging.error("Failed to unfreeze container. Trying to launch anyways...")
+         launchNow()
+@@ -91,9 +112,9 @@ def launch(args):
+ 
+ def list(args):
+     try:
+-        tools.helpers.ipc.DBusSessionService()
++        tools.helpers.ipc.DBusSessionService(args)
+ 
+-        cm = tools.helpers.ipc.DBusContainerService()
++        cm = tools.helpers.ipc.DBusContainerService(args)
+         session = cm.GetSession()
+         if session["state"] == "FROZEN":
+             cm.Unfreeze()
+diff --git a/tools/actions/bugreport.py b/tools/actions/bugreport.py
+index fa398d9..7c9b689 100644
+--- a/tools/actions/bugreport.py
++++ b/tools/actions/bugreport.py
+@@ -15,13 +15,29 @@ import time
+ WAYDROID = sys.argv[0]
+ TARBALL = "waydroid-bugreport.tar.xz"
+ 
+-def logcat(output_path):
++def logcat(args, output_path):
++    cmd = [WAYDROID, "logcat"]
++    if tools.helpers.runtime.needs_root(args):
++        cmd = ["sudo"] + cmd
+     with open(output_path, "w+") as fd:
+-        return subprocess.Popen(["sudo", WAYDROID, "logcat"], stdout=fd, stderr=sys.stderr, stdin=None)
+-
+-def dmesg(params, output_path):
++        return subprocess.Popen(cmd, stdout=fd, stderr=sys.stderr, stdin=None)
++
++def dmesg(args, params, output_path):
++    cmd = ["dmesg", "-T"] + params
++    if os.geteuid() != 0:
++        if not shutil.which("sudo"):
++            with open(output_path, "w") as fd:
++                fd.write("dmesg skipped: sudo is not available\n")
++            return None
++        if subprocess.run(["sudo", "-n", "true"], stdout=subprocess.DEVNULL,
++                          stderr=subprocess.DEVNULL).returncode != 0:
++            with open(output_path, "w") as fd:
++                fd.write("dmesg skipped: host kernel logs require root "
++                         "(passwordless sudo is not available)\n")
++            return None
++        cmd = ["sudo", "-n"] + cmd
+     with open(output_path, "w+") as fd:
+-        return subprocess.Popen(["sudo", "dmesg", "-T"] + params, stdout=fd, stderr=fd, stdin=None)
++        return subprocess.Popen(cmd, stdout=fd, stderr=fd, stdin=None)
+ 
+ def waydroid_session(output_path):
+     with open(output_path, "w+") as fd:
+@@ -59,26 +75,17 @@ def bugreport(args):
+ 
+     print("""\
+ The following information will be collected:
+-  - System kernel logs (kmsg)
++  - System kernel logs (dmesg; optional, requires root)
+   - Android system and user logs (logcat)
+-  - Waydroid container manager logs (/var/lib/waydroid/waydroid.log)
+-  - Waydroid configuration files (/var/lib/waydroid/*)
++  - Waydroid container manager logs (<work>/waydroid.log)
++  - Waydroid configuration files (<work>/*)
+ 
+ The information will be stored on your machine.
+ 
+-Please authenticate as administrator in order to read system logs.
++Host kernel logs are optional; if passwordless sudo is unavailable they are
++skipped and the rest of the report is still collected.
+ """)
+ 
+-    try:
+-        subprocess.run(["sudo", "-v"], check=True)
+-        print()
+-    except FileNotFoundError:
+-        print("The 'sudo' command is not available. Cannot read system logs.")
+-        return
+-    except subprocess.CalledProcessError:
+-        print("Authentication failed or was cancelled.")
+-        return
+-
+     procs = []
+     logfiles = []
+     def logfile(name):
+@@ -88,7 +95,7 @@ Please authenticate as administrator in order to read system logs.
+ 
+     session = None
+     try:
+-        session = tools.helpers.ipc.DBusContainerService().GetSession()
++        session = tools.helpers.ipc.DBusContainerService(args).GetSession()
+     except dbus.DBusException:
+         pass
+ 
+@@ -97,7 +104,7 @@ Please authenticate as administrator in order to read system logs.
+         procs.append(waydroid_session(logfile("session.txt")))
+         sleep_progress(10)
+         try:
+-            session = tools.helpers.ipc.DBusContainerService().GetSession()
++            session = tools.helpers.ipc.DBusContainerService(args).GetSession()
+         except dbus.DBusException:
+             pass
+ 
+@@ -106,13 +113,14 @@ Please authenticate as administrator in order to read system logs.
+ \033[1mPlease try to reproduce the problem now.\033[0m\n\
+ Waydroid will collect logs for up to 5 minutes. You may interrupt this operation earlier.\n\
+ ")
+-        procs.append(logcat(logfile("logcat.txt")))
+-        procs.append(dmesg(["-w"], logfile("dmesg.txt")))
++        procs.append(logcat(args, logfile("logcat.txt")))
++        procs.append(dmesg(args, ["-w"], logfile("dmesg.txt")))
+         sleep_progress(5 * 60)
+     else:
+         print("Session did not start\n")
+-        procs.append(dmesg([], logfile("dmesg.txt")))
++        procs.append(dmesg(args, [], logfile("dmesg.txt")))
+ 
++    procs = [p for p in procs if p is not None]
+     for p in procs:
+         p.terminate()
+     for p in procs:
+@@ -123,11 +131,11 @@ Waydroid will collect logs for up to 5 minutes. You may interrupt this operation
+     try:
+         with tarfile.open(TARBALL, "w:xz", preset=9) as tar:
+             files = [
+-                "/var/lib/waydroid/waydroid.log",
+-                "/var/lib/waydroid/waydroid.cfg",
+-                "/var/lib/waydroid/waydroid_base.prop",
+-                "/var/lib/waydroid/waydroid.prop",
+-                "/var/lib/waydroid/lxc",
++                args.work + "/waydroid.log",
++                args.work + "/waydroid.cfg",
++                args.work + "/waydroid_base.prop",
++                args.work + "/waydroid.prop",
++                args.work + "/lxc",
+             ] + logfiles
+ 
+             for f in files:
+diff --git a/tools/actions/container_manager.py b/tools/actions/container_manager.py
+index 6e088bb..deaf48a 100644
+--- a/tools/actions/container_manager.py
++++ b/tools/actions/container_manager.py
+@@ -3,11 +3,9 @@
+ 
+ import logging
+ import os
+-import glob
+ import signal
+ import tools.config
+ from contextlib import suppress
+-from shutil import which
+ from tools import helpers
+ from tools import services
+ from tools import actions
+@@ -16,6 +14,18 @@ import dbus.service
+ import dbus.exceptions
+ from gi.repository import GLib
+ 
++
++def _bus(args):
++    """Return the D-Bus the container daemons bind to.
++
++    The rootful LXC runtime owns id.waydro.Container on the system bus; a
++    rootless backend runs the same daemons on the session bus instead (see
++    helpers.runtime / docs/rfc/rootless-backend.md).
++    """
++    if helpers.runtime.uses_system_bus(args):
++        return dbus.SystemBus()
++    return dbus.SessionBus()
++
+ class DbusContainerManager(dbus.service.Object):
+     def __init__(self, looper, bus, object_path, args):
+         self.args = args
+@@ -60,50 +70,11 @@ class DbusContainerManager(dbus.service.Object):
+             raise RuntimeError("Waydroid is not initialized")
+         try:
+             session = self.args.session
+-            session["state"] = helpers.lxc.status(self.args)
++            session["state"] = helpers.runtime.get(self.args).status(self.args)
+             return session
+         except AttributeError:
+             return {}
+ 
+-def set_permissions(args, perm_list=None, mode="777"):
+-    def chmod(path, mode):
+-        if os.path.exists(path):
+-            command = ["chmod", mode, "-R", path]
+-            tools.helpers.run.user(args, command, check=False)
+-
+-    # Nodes list
+-    if not perm_list:
+-        perm_list = [
+-            "/dev/ashmem",
+-
+-            # sw_sync for HWC
+-            "/dev/sw_sync",
+-            "/sys/kernel/debug/sync/sw_sync",
+-
+-            # Media
+-            "/dev/Vcodec",
+-            "/dev/MTK_SMI",
+-            "/dev/mdp_sync",
+-            "/dev/mtk_cmdq",
+-
+-            # Graphics
+-            "/dev/graphics",
+-            "/dev/pvr_sync",
+-            "/dev/ion",
+-        ]
+-
+-        # DRM render nodes
+-        perm_list.extend(glob.glob("/dev/dri/renderD*"))
+-        # Framebuffers
+-        perm_list.extend(glob.glob("/dev/fb*"))
+-        # Videos
+-        perm_list.extend(glob.glob("/dev/video*"))
+-        # DMA-BUF Heaps
+-        perm_list.extend(glob.glob("/dev/dma_heap/*"))
+-
+-    for path in perm_list:
+-        chmod(path, mode)
+-
+ def start(args):
+     mainloop = GLib.MainLoop()
+ 
+@@ -115,11 +86,12 @@ def start(args):
+     GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, sigint_handler, None)
+     GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, sigint_handler, None)
+ 
+-    initializer = actions.initializer.DbusInitializer(mainloop, dbus.SystemBus(), '/Initializer', args)
+-    _container_manager = DbusContainerManager(mainloop, dbus.SystemBus(), '/ContainerManager', args)
++    bus = _bus(args)
++    initializer = actions.initializer.DbusInitializer(mainloop, bus, '/Initializer', args)
++    _container_manager = DbusContainerManager(mainloop, bus, '/ContainerManager', args)
+ 
+     try:
+-        _name = dbus.service.BusName("id.waydro.Container", dbus.SystemBus(), do_not_queue=True)
++        _name = dbus.service.BusName("id.waydro.Container", bus, do_not_queue=True)
+     except dbus.exceptions.NameExistsException:
+         logging.error("Container service is already running")
+         return
+@@ -130,26 +102,6 @@ def start(args):
+         initializer.worker_thread.kill()
+         initializer.worker_thread.join()
+ 
+-prepared_drivers = False
+-def prepare_drivers_once(args):
+-    global prepared_drivers
+-    if prepared_drivers:
+-        return
+-
+-    # Load binder and ashmem drivers
+-    cfg = tools.config.load(args)
+-    if cfg["waydroid"]["vendor_type"] == "MAINLINE":
+-        if helpers.drivers.probeBinderDriver(args) != 0:
+-            logging.error("Failed to load Binder driver")
+-        helpers.drivers.probeAshmemDriver(args)
+-    helpers.drivers.loadBinderNodes(args)
+-    set_permissions(args, [
+-        "/dev/" + args.BINDER_DRIVER,
+-        "/dev/" + args.VNDBINDER_DRIVER,
+-        "/dev/" + args.HWBINDER_DRIVER
+-    ], "666")
+-    prepared_drivers = True
+-
+ def do_start(args, session):
+     if not actions.initializer.is_initialized(args):
+         raise RuntimeError("Waydroid is not initialized")
+@@ -157,66 +109,18 @@ def do_start(args, session):
+     if "session" in args:
+         raise RuntimeError("Already tracking a session")
+ 
+-    prepare_drivers_once(args)
++    backend = helpers.runtime.get(args)
++    backend.prepare_drivers(args)
+ 
+     logging.info("Starting up container for a new session")
+ 
+-    # Networking
+-    command = [tools.config.tools_src +
+-               "/data/scripts/waydroid-net.sh", "start"]
+-    tools.helpers.run.user(args, command)
+-
+-    # Sensors
+-    if which("waydroid-sensord"):
+-        tools.helpers.run.user(
+-            args, ["waydroid-sensord", "/dev/" + args.HWBINDER_DRIVER], output="background")
++    backend.setup_host_services(args)
++    backend.prepare_session(args, session)
++    backend.set_protocol(args)
+ 
+-    # Cgroup hacks
+-    if which("start"):
+-        command = ["start", "cgroup-lite"]
+-        tools.helpers.run.user(args, command, check=False)
+-
+-    # Keep schedtune around in case nesting is supported
+-    if os.path.ismount("/sys/fs/cgroup/schedtune"):
+-        try:
+-            os.mkdir("/sys/fs/cgroup/schedtune/probe0")
+-            os.mkdir("/sys/fs/cgroup/schedtune/probe0/probe1")
+-        except OSError:
+-            command = ["umount", "-l", "/sys/fs/cgroup/schedtune"]
+-            tools.helpers.run.user(args, command, check=False)
+-        finally:
+-            if os.path.exists("/sys/fs/cgroup/schedtune/probe0/probe1"):
+-                os.rmdir("/sys/fs/cgroup/schedtune/probe0/probe1")
+-            if os.path.exists("/sys/fs/cgroup/schedtune/probe0"):
+-                os.rmdir("/sys/fs/cgroup/schedtune/probe0")
+-
+-    #TODO: remove NFC hacks
+-    if which("stop"):
+-        command = ["stop", "nfcd"]
+-        tools.helpers.run.user(args, command, check=False)
+-    elif which("systemctl") and (tools.helpers.run.user(args, ["systemctl", "is-active", "-q", "nfcd"], check=False) == 0):
+-        command = ["systemctl", "stop", "nfcd"]
+-        tools.helpers.run.user(args, command, check=False)
+-
+-    # Set permissions
+-    set_permissions(args)
+-
+-    # Create session-specific LXC config file
+-    helpers.lxc.generate_session_lxc_config(args, session)
+-    # Backwards compatibility
+-    with open(tools.config.defaults["lxc"] + "/waydroid/config") as f:
+-        if "config_session" not in f.read():
+-            helpers.mount.bind(args, session["waydroid_data"],
+-                               tools.config.defaults["data"])
+-
+-    # Mount rootfs
+-    cfg = tools.config.load(args)
+-    helpers.images.mount_rootfs(args, cfg["waydroid"]["images_path"], session)
+-
+-    helpers.protocol.set_aidl_version(args)
+-
+-    helpers.lxc.start(args)
+-    services.hardware_manager.start(args)
++    backend.start(args, session)
++    if helpers.runtime.host_binder(args):
++        services.hardware_manager.start(args)
+ 
+     args.session = session
+ 
+@@ -227,40 +131,19 @@ def stop(args, quit_session=True):
+     logging.info("Stopping container")
+ 
+     try:
+-        services.hardware_manager.stop(args)
+-        status = helpers.lxc.status(args)
++        backend = helpers.runtime.get(args)
++
++        if helpers.runtime.host_binder(args):
++            services.hardware_manager.stop(args)
++
++        status = backend.status(args)
+         if status != "STOPPED":
+-            helpers.lxc.stop(args)
+-            while helpers.lxc.status(args) != "STOPPED":
++            backend.stop(args)
++            while backend.status(args) != "STOPPED":
+                 pass
+ 
+-        # Networking
+-        command = [tools.config.tools_src +
+-                   "/data/scripts/waydroid-net.sh", "stop"]
+-        tools.helpers.run.user(args, command, check=False)
+-
+-        #TODO: remove NFC hacks
+-        if which("start"):
+-            command = ["start", "nfcd"]
+-            tools.helpers.run.user(args, command, check=False)
+-        elif which("systemctl") and (tools.helpers.run.user(args, ["systemctl", "is-enabled", "-q", "nfcd"], check=False) == 0):
+-            command = ["systemctl", "start", "nfcd"]
+-            tools.helpers.run.user(args, command, check=False)
+-
+-        # Sensors
+-        if which("waydroid-sensord"):
+-            command = ["pidof", "waydroid-sensord"]
+-            pid = tools.helpers.run.user(args, command, check=False, output_return=True).strip()
+-            if pid:
+-                command = ["kill", "-9", pid]
+-                tools.helpers.run.user(args, command, check=False)
+-
+-        # Umount rootfs
+-        helpers.images.umount_rootfs(args)
+-
+-        # Backwards compatibility
+-        with suppress(Exception):
+-            helpers.mount.umount_all(args, tools.config.defaults["data"])
++        backend.teardown_host_services(args)
++        backend.teardown_session(args)
+ 
+         if "session" in args:
+             if quit_session:
+@@ -271,26 +154,51 @@ def stop(args, quit_session=True):
+     except Exception as e:
+         logging.debug("Error while stopping container: %s", e)
+ 
++def stop_cli(args):
++    """`waydroid container stop` from the CLI.
++
++    Prefer the daemon (standalone or merged into the session): it stops the
++    container *and* terminates the session it is tracking.  Fall back to a
++    direct stop when no daemon is listening.
++    """
++    try:
++        helpers.ipc.DBusContainerService(args).Stop(True)
++        return
++    except dbus.DBusException:
++        pass
++    stop(args)
++
++
+ def restart(args):
+-    status = helpers.lxc.status(args)
++    backend = helpers.runtime.get(args)
++    status = backend.status(args)
++    if status == "FROZEN":
++        backend.unfreeze(args)
++        while backend.status(args) == "FROZEN":
++            pass
++        status = backend.status(args)
+     if status == "RUNNING":
+-        helpers.lxc.stop(args)
+-        helpers.lxc.start(args)
++        backend.stop(args)
++        backend.start(args, getattr(args, "session", None))
+     else:
+         logging.error("WayDroid container is {}".format(status))
+ 
+ def freeze(args):
+-    status = helpers.lxc.status(args)
++    backend = helpers.runtime.get(args)
++    status = backend.status(args)
+     if status == "RUNNING":
+-        helpers.lxc.freeze(args)
+-        while helpers.lxc.status(args) == "RUNNING":
++        backend.freeze(args)
++        while backend.status(args) == "RUNNING":
+             pass
+     else:
+         logging.error("WayDroid container is {}".format(status))
+ 
+ def unfreeze(args):
+-    status = helpers.lxc.status(args)
++    backend = helpers.runtime.get(args)
++    status = backend.status(args)
+     if status == "FROZEN":
+-        helpers.lxc.unfreeze(args)
+-        while helpers.lxc.status(args) == "FROZEN":
++        backend.unfreeze(args)
++        while backend.status(args) == "FROZEN":
+             pass
++    else:
++        logging.error("WayDroid container is {}".format(status))
+diff --git a/tools/actions/initializer.py b/tools/actions/initializer.py
+index c3ab342..7d7fc09 100644
+--- a/tools/actions/initializer.py
++++ b/tools/actions/initializer.py
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: GPL-3.0-or-later
+ import logging
+ import os
++import subprocess
+ from tools import helpers
+ import tools.config
+ import stat
+@@ -17,7 +18,7 @@ import argparse
+ from gi.repository import GLib
+ 
+ def is_initialized(args):
+-    return os.path.isfile(args.config) and os.path.isdir(tools.config.defaults["rootfs"])
++    return helpers.runtime.is_initialized(args)
+ 
+ def get_vendor_type(args):
+     vndk_str = helpers.props.host_get(args, "ro.vndk.version")
+@@ -48,10 +49,13 @@ def setup_config(args):
+     args.vendor_type = get_vendor_type(args)
+     cfg["waydroid"]["vendor_type"] = args.vendor_type
+ 
+-    helpers.drivers.setupBinderNodes(args)
+-    cfg["waydroid"]["binder"] = args.BINDER_DRIVER
+-    cfg["waydroid"]["vndbinder"] = args.VNDBINDER_DRIVER
+-    cfg["waydroid"]["hwbinder"] = args.HWBINDER_DRIVER
++    # The rootful runtime needs the host binder nodes set up (and chmod'ed) by
++    # root.  A rootless backend never touches them.
++    if helpers.runtime.needs_root(args):
++        helpers.drivers.setupBinderNodes(args)
++        cfg["waydroid"]["binder"] = args.BINDER_DRIVER
++        cfg["waydroid"]["vndbinder"] = args.VNDBINDER_DRIVER
++        cfg["waydroid"]["hwbinder"] = args.HWBINDER_DRIVER
+ 
+     has_preinstalled_images = False
+     preinstalled_images_paths = tools.config.defaults["preinstalled_images_paths"]
+@@ -127,17 +131,71 @@ def setup_config(args):
+     tools.config.save(args, cfg)
+     return True
+ 
++def _init_image(args, backend):
++    """Image mode: pull the published image, tag it, prepare the host and
++    start the per-user service.  A failed pull leaves the running container
++    untouched."""
++    cfg = tools.config.load(args)
++    image = cfg["waydroid"].get("podman_image") or ""
++    remote = cfg["waydroid"].get("podman_image_remote") or image
++    if not image and remote:
++        cfg["waydroid"]["podman_image"] = remote
++        tools.config.save(args, cfg)
++        image = remote
++    if not image:
++        logging.error("podman_image or podman_image_remote must be set")
++        return
++
++    logging.info("Pulling %s", remote)
++    try:
++        result = subprocess.run(["podman", "pull", remote],
++                                capture_output=True, text=True, timeout=600)
++    except Exception as e:
++        logging.error("podman pull failed: %s", e)
++        return
++    if result.returncode != 0:
++        logging.error("podman pull %s failed: %s", remote,
++                      (result.stderr or result.stdout).strip())
++        return
++    if remote != image:
++        tagged = subprocess.run(["podman", "tag", remote, image],
++                                capture_output=True, text=True)
++        if tagged.returncode != 0:
++            logging.error("podman tag %s %s failed: %s", remote, image,
++                          (tagged.stderr or tagged.stdout).strip())
++            return
++        logging.info("Tagged %s as %s", remote, image)
++
++    backend.setup_host(args)
++    if helpers.service.restart_user_service(args):
++        logging.info("Started waydroid.service")
++    else:
++        logging.warning("Image ready; start a session with "
++                        "`waydroid session start`")
++
++
+ def init(args):
++    backend = helpers.runtime.get(args)
++    if getattr(backend, "uses_image", None) and backend.uses_image(args):
++        _init_image(args, backend)
++        return
++
+     if is_initialized(args) and not args.force:
+         logging.info("Already initialized")
+ 
+     if not setup_config(args):
+         return
+ 
++    if not helpers.runtime.needs_root(args):
++        # Rootless backend: no LXC config, no host permission surgery -- only
++        # backend-specific host preparation (base props, state directories).
++        backend.setup_host(args)
++        return
++
+     status = "STOPPED"
+     session = None
+     if os.path.exists(tools.config.defaults["lxc"] + "/waydroid"):
+-        status = helpers.lxc.status(args)
++        status = backend.status(args)
+     if status != "STOPPED":
+         if "running_init_in_service" in args:
+             session = args.session
+@@ -145,7 +203,7 @@ def init(args):
+         else:
+             logging.info("Stopping container")
+             try:
+-                container = tools.helpers.ipc.DBusContainerService()
++                container = tools.helpers.ipc.DBusContainerService(args)
+                 session = container.GetSession()
+                 container.Stop(False)
+             except Exception as e:
+@@ -165,9 +223,7 @@ def init(args):
+         os.mkdir(tools.config.defaults["overlay_rw"]+"/system")
+         os.mkdir(tools.config.defaults["overlay_rw"]+"/vendor")
+     helpers.drivers.probeAshmemDriver(args)
+-    helpers.lxc.setup_host_perms(args)
+-    helpers.lxc.set_lxc_config(args)
+-    helpers.lxc.make_base_props(args)
++    backend.setup_host(args)
+     if status != "STOPPED":
+         try:
+             if "running_init_in_service" in args:
+@@ -424,7 +480,7 @@ def remote_init_client(args):
+         def on_destroy(self, _):
+             if self.initializing:
+                 try:
+-                    tools.helpers.ipc.DBusContainerService("/Initializer", "id.waydro.Initializer").Cancel()
++                    tools.helpers.ipc.DBusContainerService(args, "/Initializer", "id.waydro.Initializer").Cancel()
+                 except Exception as e:
+                     logging.debug("Unexpected error while cancelling initializer: %s", e)
+             Gtk.main_quit()
+@@ -438,7 +494,7 @@ def remote_init_client(args):
+             self.initializing = True
+ 
+             try:
+-                initializer = tools.helpers.ipc.DBusContainerService("/Initializer", "id.waydro.Initializer")
++                initializer = tools.helpers.ipc.DBusContainerService(args, "/Initializer", "id.waydro.Initializer")
+ 
+                 self.bus_signals.append(initializer.connect_to_signal("ProgressChanged", self.on_progress))
+                 self.bus_signals.append(initializer.connect_to_signal("Finished", self.on_finished))
+diff --git a/tools/actions/prop.py b/tools/actions/prop.py
+index 09e66a5..c1630d1 100644
+--- a/tools/actions/prop.py
++++ b/tools/actions/prop.py
+@@ -5,9 +5,9 @@ import dbus
+ 
+ def get(args):
+     try:
+-        tools.helpers.ipc.DBusSessionService()
++        tools.helpers.ipc.DBusSessionService(args)
+ 
+-        cm = tools.helpers.ipc.DBusContainerService()
++        cm = tools.helpers.ipc.DBusContainerService(args)
+         session = cm.GetSession()
+         if session["state"] == "FROZEN":
+             cm.Unfreeze()
+@@ -23,9 +23,9 @@ def get(args):
+ 
+ def set(args):
+     try:
+-        tools.helpers.ipc.DBusSessionService()
++        tools.helpers.ipc.DBusSessionService(args)
+ 
+-        cm = tools.helpers.ipc.DBusContainerService()
++        cm = tools.helpers.ipc.DBusContainerService(args)
+         session = cm.GetSession()
+         if session["state"] == "FROZEN":
+             cm.Unfreeze()
+diff --git a/tools/actions/session_manager.py b/tools/actions/session_manager.py
+index 4e8426c..451dbd5 100644
+--- a/tools/actions/session_manager.py
++++ b/tools/actions/session_manager.py
+@@ -22,11 +22,11 @@ class DbusSessionManager(dbus.service.Object):
+     @dbus.service.method("id.waydro.SessionManager", in_signature='', out_signature='')
+     def Stop(self):
+         do_stop(self.args, self.looper)
+-        stop_container(quit_session=False)
++        stop_container(self.args, quit_session=False)
+ 
+ def handle_disconnect(args, looper):
+     do_stop(args, looper)
+-    stop_container(quit_session=False)
++    stop_container(args, quit_session=False)
+ 
+ def service(args, looper):
+     bus = dbus.SessionBus()
+@@ -48,6 +48,18 @@ def start(args, unlocked_cb=None, background=True):
+ 
+     session = copy.copy(tools.config.session_defaults)
+ 
++    # A backend may put Android's /data somewhere else (the rootless podman
++    # backend uses $WORK/data instead of the rootful $XDG_DATA_HOME path).
++    data_resolver = getattr(tools.helpers.runtime.get(args),
++                            "waydroid_data_dir", None)
++    if data_resolver:
++        session["waydroid_data"] = data_resolver(args)
++
++    # Android writes the PNGs into /data/icons; the desktop files (the
++    # host-side artifact) reference the backend's host-visible /data mount.
++    # Do not create the directory here: Android owns it.
++    session["waydroid_icons"] = os.path.join(session["waydroid_data"], "icons")
++
+     # TODO: also support WAYLAND_SOCKET?
+     wayland_display = session["wayland_display"]
+     if wayland_display == "None" or not wayland_display:
+@@ -85,7 +97,7 @@ def start(args, unlocked_cb=None, background=True):
+ 
+     def sigint_handler(data):
+         do_stop(args, mainloop)
+-        stop_container(quit_session=False)
++        stop_container(args, quit_session=False)
+ 
+     def sigusr_handler(data):
+         do_stop(args, mainloop)
+@@ -94,8 +106,39 @@ def start(args, unlocked_cb=None, background=True):
+     GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, sigint_handler, None)
+     GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, sigint_handler, None)
+     GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGUSR1, sigusr_handler, None)
++
++    # Rootless: this process is the single per-user service.  Own both
++    # well-known names and create the container control objects on this same
++    # bus/loop.  A standalone `waydroid container start` still works: if the
++    # name is already taken we fall back to the D-Bus Start() below.
++    local_container = False
++    container_name = None
++    container_initializer = None
++    if not tools.helpers.runtime.uses_system_bus(args):
++        try:
++            container_name = dbus.service.BusName(
++                "id.waydro.Container", dbus.SessionBus(), do_not_queue=True)
++        except dbus.exceptions.NameExistsException:
++            container_name = None
++        if container_name is not None:
++            from tools.actions import container_manager as _cm
++            from tools.actions import initializer as _init
++            local_container = True
++            args._local_container = True
++            bus = dbus.SessionBus()
++            container_initializer = _init.DbusInitializer(
++                mainloop, bus, '/Initializer', args)
++            _container_objects = _cm.DbusContainerManager(
++                mainloop, bus, '/ContainerManager', args)
++            logging.info("Merged the container and session control planes "
++                         "into this process")
++
+     try:
+-        tools.helpers.ipc.DBusContainerService().Start(session)
++        if local_container:
++            from tools.actions import container_manager as _cm
++            _cm.do_start(args, session)
++        else:
++            tools.helpers.ipc.DBusContainerService(args).Start(session)
+     except dbus.DBusException as e:
+         logging.debug(e)
+         if e.get_dbus_name().startswith("org.freedesktop.DBus.Python"):
+@@ -103,12 +146,28 @@ def start(args, unlocked_cb=None, background=True):
+         else:
+             logging.error("WayDroid container is not listening")
+         sys.exit(0)
++    except Exception as e:
++        logging.error(e)
++        sys.exit(1)
+ 
+-    services.user_manager.start(args, session, unlocked_cb)
+-    services.clipboard_manager.start(args)
+-    services.notification_manager.start(args, session)
++    if tools.helpers.runtime.host_binder(args):
++        services.user_manager.start(args, session, unlocked_cb)
++        services.clipboard_manager.start(args)
++        services.notification_manager.start(args, session)
++    else:
++        # Rootless backend without host binder: the gbinder-based services have
++        # no service manager to talk to (see docs/rfc/rootless-backend.md).
++        logging.warning("Skipping host integration services: Android's binder "
++                        "is not reachable from the host with this backend")
++        if unlocked_cb:
++            unlocked_cb()
+     service(args, mainloop)
+ 
++    if container_initializer is not None \
++            and container_initializer.worker_thread is not None:
++        container_initializer.worker_thread.kill()
++        container_initializer.worker_thread.join()
++
+ def do_stop(args, looper):
+     services.user_manager.stop(args)
+     services.clipboard_manager.stop(args)
+@@ -117,12 +176,16 @@ def do_stop(args, looper):
+ 
+ def stop(args):
+     try:
+-        tools.helpers.ipc.DBusSessionService().Stop()
++        tools.helpers.ipc.DBusSessionService(args).Stop()
+     except dbus.DBusException:
+-        stop_container(quit_session=True)
++        stop_container(args, quit_session=True)
+ 
+-def stop_container(quit_session):
++def stop_container(args, quit_session):
++    if getattr(args, "_local_container", False):
++        from tools.actions import container_manager as _cm
++        _cm.stop(args, quit_session)
++        return
+     try:
+-        tools.helpers.ipc.DBusContainerService().Stop(quit_session)
++        tools.helpers.ipc.DBusContainerService(args).Stop(quit_session)
+     except dbus.DBusException:
+         pass
+diff --git a/tools/actions/status.py b/tools/actions/status.py
+index 896a8af..77fbeb9 100644
+--- a/tools/actions/status.py
++++ b/tools/actions/status.py
+@@ -12,12 +12,12 @@ def print_status(args):
+         print("Vendor type:\t" + cfg["waydroid"]["vendor_type"])
+ 
+     try:
+-        session = tools.helpers.ipc.DBusContainerService().GetSession()
++        session = tools.helpers.ipc.DBusContainerService(args).GetSession()
+         if session:
+             print("Session:\tRUNNING")
+             print("Container:\t" + session["state"])
+             print("Vendor type:\t" + cfg["waydroid"]["vendor_type"])
+-            print("IP address:\t" + (tools.helpers.net.get_device_ip_address() or "UNKNOWN"))
++            print("IP address:\t" + (tools.helpers.net.get_device_ip_address(args) or "UNKNOWN"))
+             print("Session user:\t{}({})".format(session["user_name"], session["user_id"]))
+             print("Wayland display:\t" + session["wayland_display"])
+         else:
+diff --git a/tools/actions/upgrader.py b/tools/actions/upgrader.py
+index eb97123..e510091 100644
+--- a/tools/actions/upgrader.py
++++ b/tools/actions/upgrader.py
+@@ -2,17 +2,20 @@
+ # SPDX-License-Identifier: GPL-3.0-or-later
+ import logging
+ import os
++import subprocess
+ from tools import helpers
+ from tools.helpers.version import versiontuple
+ import tools.config
+ 
+ def get_config(args):
+     cfg = tools.config.load(args)
+-    args.arch = cfg["waydroid"]["arch"]
+-    args.images_path = cfg["waydroid"]["images_path"]
+-    args.vendor_type = cfg["waydroid"]["vendor_type"]
+-    args.system_ota = cfg["waydroid"]["system_ota"]
+-    args.vendor_ota = cfg["waydroid"]["vendor_ota"]
++    args.arch = cfg["waydroid"].get("arch") or tools.config.defaults["arch"]
++    args.images_path = (cfg["waydroid"].get("images_path")
++                        or tools.config.defaults["images_path"])
++    args.vendor_type = (cfg["waydroid"].get("vendor_type")
++                        or tools.config.defaults["vendor_type"])
++    args.system_ota = cfg["waydroid"].get("system_ota") or "None"
++    args.vendor_ota = cfg["waydroid"].get("vendor_ota") or "None"
+     args.session = None
+ 
+ def migration(args):
+@@ -31,15 +34,68 @@ def migration(args):
+     except Exception as e:
+         logging.debug("Error during migration: %s", e)
+ 
++def _upgrade_image(args):
++    """Image mode: pull the published image (or skip with --offline) and
++    restart the per-user service.  A failed pull leaves the running image and
++    container untouched."""
++    cfg = tools.config.load(args)
++    image = cfg["waydroid"].get("podman_image") or ""
++    remote = cfg["waydroid"].get("podman_image_remote") or image
++    if not image:
++        logging.error("podman_image is not set")
++        return
++
++    if not args.offline:
++        if not remote:
++            logging.error("podman_image_remote is not set")
++            return
++        logging.info("Pulling %s", remote)
++        try:
++            result = subprocess.run(["podman", "pull", remote],
++                                    capture_output=True, text=True,
++                                    timeout=600)
++        except Exception as e:
++            logging.error("podman pull failed: %s", e)
++            return
++        if result.returncode != 0:
++            logging.error("podman pull %s failed: %s", remote,
++                          (result.stderr or result.stdout).strip())
++            logging.error("The running image is unchanged. Set "
++                          "podman_image_remote to the published image, or "
++                          "rebuild locally with image/build.sh and run "
++                          "`waydroid upgrade --offline`.")
++            return
++        if remote != image:
++            tagged = subprocess.run(["podman", "tag", remote, image],
++                                    capture_output=True, text=True)
++            if tagged.returncode != 0:
++                logging.error("podman tag %s %s failed: %s", remote, image,
++                              (tagged.stderr or tagged.stdout).strip())
++                return
++            logging.info("Tagged %s as %s", remote, image)
++
++    if helpers.service.restart_user_service(args):
++        logging.info("Restarted waydroid.service")
++        return
++
++    logging.warning("Could not restart waydroid.service; stopping the running "
++                    "container. Start a new session with `waydroid session "
++                    "start` after the image is ready.")
++    from tools.actions import container_manager
++    container_manager.stop(args)
++
++
+ def upgrade(args):
++    backend = helpers.runtime.get(args)
++    if getattr(backend, "uses_image", None) and backend.uses_image(args):
++        _upgrade_image(args)
++        return
+     get_config(args)
+-    status = "STOPPED"
+-    if os.path.exists(tools.config.defaults["lxc"] + "/waydroid"):
+-        status = helpers.lxc.status(args)
++    status = backend.status(args)
+     if status != "STOPPED":
+         logging.info("Stopping container")
+         try:
+-            container = tools.helpers.ipc.DBusContainerService()
++            container = tools.helpers.ipc.DBusContainerService(args)
+             args.session = container.GetSession()
+             container.Stop(False)
+         except Exception as e:
+@@ -53,9 +109,7 @@ def upgrade(args):
+         else:
+             logging.info("Upgrade refused because Waydroid was configured to load pre-installed image from {}.".format(args.images_path))
+     helpers.drivers.probeAshmemDriver(args)
+-    helpers.lxc.setup_host_perms(args)
+-    helpers.lxc.set_lxc_config(args)
+-    helpers.lxc.make_base_props(args)
++    backend.setup_host(args)
+     if status != "STOPPED":
+         logging.info("Starting container")
+         try:
+diff --git a/tools/config/__init__.py b/tools/config/__init__.py
+index 8fce3be..136afab 100644
+--- a/tools/config/__init__.py
++++ b/tools/config/__init__.py
+@@ -23,7 +23,15 @@ config_keys = ["arch",
+                "vendor_datetime",
+                "suspend_action",
+                "mount_overlays",
+-               "auto_adb"]
++               "auto_adb",
++               "container_backend",
++               "podman_image",
++               "podman_image_remote",
++               "podman_data_volume",
++               "podman_adb_port",
++               "podman_binderfs",
++               "podman_uid_map",
++               "podman_pasta_options"]
+ 
+ # Config file/commandline default values
+ # $WORK gets replaced with the actual value for args.work (which may be
+@@ -43,6 +51,44 @@ defaults = {
+     "auto_adb": "False",
+     "container_xdg_runtime_dir": "/run/xdg",
+     "container_wayland_display": "wayland-0",
++    # Container runtime backend: "lxc" (the historical rootful runtime) or
++    # "podman" (rootless).  See tools/helpers/runtime/ and
++    # docs/rfc/rootless-backend.md.
++    "container_backend": "lxc",
++    # podman backend knobs (ignored by the lxc backend):
++    #   podman_image     - required: the OCI image to boot.  There is no
++    #                      external-rootfs mode; how the image is built is the
++    #                      build system's concern (see waydroid-rootless/image).
++    #   podman_image_remote - image ref pulled by `waydroid upgrade` and then
++    #                      tagged as podman_image (placeholder until images are
++    #                      published; a failed pull leaves the running image
++    #                      untouched).  `waydroid upgrade --offline` skips the
++    #                      pull and only restarts the user service.
++    #   podman_data_volume - named podman volume mounted at Android's /data
++    #                      (default "waydroid-data").  Wipe it with
++    #                      `podman volume rm <name>`.  Upstream semantics: the
++    #                      backend never wipes /data on an Android upgrade.
++    #   podman_adb_port  - host loopback TCP port forwarded by pasta to the
++    #                      container's adbd (default 5555; "0" disables).
++    #                      `waydroid adb connect` then uses 127.0.0.1:<port>.
++    #   podman_binderfs  - "container" (binderfs created inside the container
++    #                      by devstage; the host reaches Android's service
++    #                      manager through the wd-broker fd pass, so the
++    #                      gbinder session services work without root) or
++    #                      "host" (legacy: share the host's /dev/binderfs
++    #                      nodes; rootless cannot claim the context manager)
++    #   podman_uid_map   - "auto" (derive from /etc/subuid), "keep-id" (let
++    #                      podman generate the mapping) or an explicit
++    #                      --userns= value
++    #   podman_pasta_options - extra comma-separated pasta options appended to
++    #                      the --network string
++    "podman_image": "",
++    "podman_image_remote": "registry.example.invalid/waydroid/waydroid-arm64:13",
++    "podman_data_volume": "waydroid-data",
++    "podman_adb_port": "5555",
++    "podman_binderfs": "container",
++    "podman_uid_map": "auto",
++    "podman_pasta_options": "",
+ }
+ defaults["images_path"] = defaults["work"] + "/images"
+ defaults["rootfs"] = defaults["work"] + "/rootfs"
+@@ -54,6 +100,26 @@ defaults["lxc"] = defaults["work"] + "/lxc"
+ defaults["host_perms"] = defaults["work"] + "/host-permissions"
+ defaults["container_pulse_runtime_path"] = defaults["container_xdg_runtime_dir"] + "/pulse"
+ 
++
++def rebase(work):
++    """Re-derive the $WORK-relative default paths for a custom work directory.
++
++    Upstream assumes $WORK is /var/lib/waydroid (root-owned) and every derived
++    path is computed once at import time.  A rootless backend keeps its state in
++    a user-writable directory instead, so tools.prep_args() calls this with the
++    requested path and all the /var/lib/waydroid-derived defaults follow.
++    """
++    work = os.path.normpath(os.path.expanduser(work))
++    defaults["work"] = work
++    defaults["images_path"] = work + "/images"
++    defaults["rootfs"] = work + "/rootfs"
++    defaults["overlay"] = work + "/overlay"
++    defaults["overlay_rw"] = work + "/overlay_rw"
++    defaults["overlay_work"] = work + "/overlay_work"
++    defaults["data"] = work + "/data"
++    defaults["lxc"] = work + "/lxc"
++    defaults["host_perms"] = work + "/host-permissions"
++
+ session_defaults = {
+     "user_name": pwd.getpwuid(os.getuid()).pw_name,
+     "user_id": str(os.getuid()),
+diff --git a/tools/helpers/__init__.py b/tools/helpers/__init__.py
+index 73c1a2a..f1992a7 100644
+--- a/tools/helpers/__init__.py
++++ b/tools/helpers/__init__.py
+@@ -13,3 +13,5 @@ import tools.helpers.gpu
+ import tools.helpers.protocol
+ import tools.helpers.version
+ import tools.helpers.logging
++import tools.helpers.service
++import tools.helpers.runtime
+diff --git a/tools/helpers/drivers.py b/tools/helpers/drivers.py
+index 3045ee5..44cf5cd 100644
+--- a/tools/helpers/drivers.py
++++ b/tools/helpers/drivers.py
+@@ -167,6 +167,28 @@ def setupBinderNodes(args):
+             raise OSError('Binder node "hwbinder" for waydroid not found')
+ 
+ def loadBinderNodes(args):
++    # A backend may expose Android's binder nodes through a per-process fd
++    # broker instead of the host's /dev (the rootless podman backend does this:
++    # binderfs is container-local and cannot be reopened from the host).  It
++    # returns gbinder driver names such as "fd/7", which the interfaces turn
++    # into /dev/fd/7.
++    try:
++        from tools.helpers import runtime
++        backend = runtime.get(args)
++        resolver = getattr(backend, "binder_device_paths", None)
++        if resolver is not None:
++            paths = resolver(args)
++            if paths:
++                cfg = tools.config.load(args)
++                (args.BINDER_DRIVER, args.VNDBINDER_DRIVER,
++                 args.HWBINDER_DRIVER) = paths
++                args.BINDER_PROTOCOL = cfg["waydroid"].get("binder_protocol")
++                args.SERVICE_MANAGER_PROTOCOL = cfg["waydroid"].get(
++                    "service_manager_protocol")
++                return
++    except Exception as e:
++        logging.debug("binder device resolver unavailable: %s", e)
++
+     cfg = tools.config.load(args)
+     args.BINDER_DRIVER = cfg["waydroid"]["binder"]
+     args.VNDBINDER_DRIVER = cfg["waydroid"]["vndbinder"]
+diff --git a/tools/helpers/ipc.py b/tools/helpers/ipc.py
+index d5f42c0..ac6ef9a 100644
+--- a/tools/helpers/ipc.py
++++ b/tools/helpers/ipc.py
+@@ -1,12 +1,27 @@
+ # Copyright 2022 Alessandro Astone
+ # SPDX-License-Identifier: GPL-3.0-or-later
+ 
+-# Currently implemented as FIFO
+-import os
+ import dbus
+ 
+-def DBusContainerService(object_path="/ContainerManager", intf="id.waydro.ContainerManager"):
+-    return dbus.Interface(dbus.SystemBus().get_object("id.waydro.Container", object_path), intf)
+ 
+-def DBusSessionService(object_path="/SessionManager", intf="id.waydro.SessionManager"):
+-    return dbus.Interface(dbus.SessionBus().get_object("id.waydro.Session", object_path), intf)
++def _bus(args):
++    """Return the D-Bus the container runtime daemons listen on.
++
++    The rootful LXC runtime owns the well-known name id.waydro.Container on the
++    *system* bus (it is started by a system service, as root).  A rootless
++    backend must not and cannot own a system-bus name, so those daemons live on
++    the *session* bus instead.  Which one applies is a property of the active
++    container backend (see tools/helpers/runtime).
++    """
++    if args is not None:
++        from tools import helpers
++        if helpers.runtime.uses_system_bus(args):
++            return dbus.SystemBus()
++    return dbus.SessionBus()
++
++
++def DBusContainerService(args=None, object_path="/ContainerManager", intf="id.waydro.ContainerManager"):
++    return dbus.Interface(_bus(args).get_object("id.waydro.Container", object_path), intf)
++
++def DBusSessionService(args=None, object_path="/SessionManager", intf="id.waydro.SessionManager"):
++    return dbus.Interface(_bus(args).get_object("id.waydro.Session", object_path), intf)
+diff --git a/tools/helpers/net.py b/tools/helpers/net.py
+index a4614e8..7c52763 100644
+--- a/tools/helpers/net.py
++++ b/tools/helpers/net.py
+@@ -2,11 +2,33 @@
+ # SPDX-License-Identifier: GPL-3.0-or-later
+ 
+ import tools.helpers.run
++import subprocess
+ import logging
+ import re
+ from contextlib import suppress
+ from shutil import which
+ 
++
++def _adb_target(args):
++    """Address `adb connect` should use.
++
++    Rootless podman forwards a host loopback port to the container's adbd
++    (pasta would otherwise drop all TCP via podman's "-t none"), so the
++    backend's `adb_address()` wins over the guest IP.
++    """
++    if args is not None:
++        try:
++            resolver = getattr(tools.helpers.runtime.get(args),
++                               "adb_address", None)
++            if resolver:
++                target = resolver(args)
++                if target:
++                    return target
++        except Exception as e:
++            logging.debug("backend adb address lookup failed: %s", e)
++    return get_device_ip_address(args)
++
++
+ def adb_connect(args):
+     """
+     Creates an android debugging connection from the host system to the
+@@ -18,27 +40,62 @@ def adb_connect(args):
+         raise RuntimeError("Could not find adb")
+ 
+     # Start and 'warm up' the adb server
+-    tools.helpers.run.user(args, ["adb", "start-server"])
++    subprocess.run(["adb", "start-server"], stdout=subprocess.DEVNULL,
++                   stderr=subprocess.DEVNULL, check=False)
+ 
+-    ip = get_device_ip_address()
+-    if not ip:
++    target = _adb_target(args)
++    if not target:
+         raise RuntimeError("Unknown container IP address. Is Waydroid running?")
+ 
+-    tools.helpers.run.user(args, ["adb", "connect", ip])
+-    logging.info("Established ADB connection to Waydroid device at {}.".format(ip))
++    result = subprocess.run(["adb", "connect", target],
++                            capture_output=True, text=True)
++    output = (result.stdout + result.stderr).strip()
++    if result.returncode != 0 or "connected to" not in output:
++        hint = ""
++        if "authenticate" in output or "unauthorized" in output:
++            hint = (" Approve the 'Allow USB debugging' dialog in Android "
++                    "(tick 'Always allow from this computer').")
++        raise RuntimeError("adb connect {} failed: {}.{}".format(
++            target, output or "unknown error", hint))
++    logging.info("Established ADB connection to Waydroid device at {}."
++                 .format(target))
++
++    devices = subprocess.run(["adb", "devices"], capture_output=True,
++                             text=True).stdout
++    for line in devices.splitlines():
++        if line.startswith(target) and "unauthorized" in line:
++            logging.warning(
++                "ADB device is unauthorized: approve the 'Allow USB debugging' "
++                "dialog in Android (tick 'Always allow from this computer')")
++            break
++
+ 
+ def adb_disconnect(args):
+     if not which("adb"):
+         raise RuntimeError("Could not find adb")
+ 
+-    ip = get_device_ip_address()
+-    if not ip:
++    target = _adb_target(args)
++    if not target:
+         raise RuntimeError("Unknown container IP address. Was Waydroid ever running?")
+ 
+-    tools.helpers.run.user(args, ["adb", "disconnect", ip])
++    subprocess.run(["adb", "disconnect", target], check=False)
++
++
++def get_device_ip_address(args=None):
++    # A backend that knows the address owns the answer (pasta has no dnsmasq
++    # lease).  Returning None here is final: do not fall back to the rootful
++    # dnsmasq lease, which would show a stale LXC address.
++    if args is not None:
++        try:
++            resolver = getattr(tools.helpers.runtime.get(args),
++                               "device_ip_address", None)
++            if resolver:
++                return resolver(args)
++        except Exception as e:
++            logging.debug("backend IP lookup failed: %s", e)
++            return None
+ 
+-def get_device_ip_address():
+-    # The IP address is queried from the DHCP lease file.
++    # Rootful LXC: the IP is in the dnsmasq lease file.
+     with suppress(IOError):
+         with open("/var/lib/misc/dnsmasq.waydroid0.leases") as f:
+             match = re.search(r"(\d{1,3}\.){3}\d{1,3}\s", f.read())
+diff --git a/tools/helpers/protocol.py b/tools/helpers/protocol.py
+index 9529705..e2d024a 100644
+--- a/tools/helpers/protocol.py
++++ b/tools/helpers/protocol.py
+@@ -2,38 +2,42 @@ from tools import helpers
+ import tools.config
+ import logging
+ 
+-# Call me with rootfs mounted!
+-def set_aidl_version(args):
++def protocol_for_api(android_api):
++    """Map an Android SDK level to (binder_protocol, service_manager_protocol)."""
++    if android_api < 28:
++        return "aidl", "aidl"
++    if android_api < 30:
++        return "aidl2", "aidl2"
++    if android_api < 31:
++        return "aidl3", "aidl3"
++    if android_api < 33:
++        return "aidl4", "aidl3"
++    if android_api < 35:
++        return "aidl3", "aidl3"
++    if android_api < 36:
++        return "aidl3", "aidl5"
++    return "aidl3", "aidl6"
++
++
++# Call me with the rootfs available (mounted, extracted, or read from an image).
++def set_aidl_version(args, build_prop=None):
+     cfg = tools.config.load(args)
++    if build_prop is None:
++        build_prop = tools.config.defaults["rootfs"] + "/system/build.prop"
+     android_api = 0
+     try:
+-        android_api = int(helpers.props.file_get(args,
+-                tools.config.defaults["rootfs"] + "/system/build.prop",
+-                "ro.build.version.sdk"))
++        android_api = int(helpers.props.file_get(
++            args, build_prop, "ro.build.version.sdk"))
+     except Exception as e:
+-        logging.error("Failed to parse android version from system.img: %s", e)
++        logging.error("Failed to parse android version from %s: %s",
++                      build_prop, e)
+ 
+-    if android_api < 28:
+-        binder_protocol = "aidl"
+-        sm_protocol =     "aidl"
+-    elif android_api < 30:
+-        binder_protocol = "aidl2"
+-        sm_protocol =     "aidl2"
+-    elif android_api < 31:
+-        binder_protocol = "aidl3"
+-        sm_protocol =     "aidl3"
+-    elif android_api < 33:
+-        binder_protocol = "aidl4"
+-        sm_protocol =     "aidl3"
+-    elif android_api < 35:
+-        binder_protocol = "aidl3"
+-        sm_protocol =     "aidl3"
+-    elif android_api < 36:
+-        binder_protocol = "aidl3"
+-        sm_protocol =     "aidl5"
+-    else:
+-        binder_protocol = "aidl3"
+-        sm_protocol =     "aidl6"
++    if not android_api:
++        logging.error("Unknown Android SDK in %s; leaving the binder "
++                      "protocol unchanged", build_prop)
++        return
++
++    binder_protocol, sm_protocol = protocol_for_api(android_api)
+ 
+     cfg["waydroid"]["binder_protocol"] = binder_protocol
+     cfg["waydroid"]["service_manager_protocol"] = sm_protocol
+diff --git a/tools/helpers/runtime/__init__.py b/tools/helpers/runtime/__init__.py
+new file mode 100644
+index 0000000..699f38d
+--- /dev/null
++++ b/tools/helpers/runtime/__init__.py
+@@ -0,0 +1,100 @@
++# Copyright 2026 The Waydroid contributors
++# SPDX-License-Identifier: GPL-3.0-or-later
++"""
++Container runtime backends.
++
++Historically `tools/helpers/lxc.py` was "all the runtime knowledge": it both
++wrote the LXC configuration and shelled out to lxc-start/lxc-stop/lxc-info.
++This package turns that into a small backend abstraction so that a second
++runtime -- rootless podman -- can be plugged in without touching the rest of
++the CLI.
++
++Backends live in this package and expose the same surface:
++
++    NAME                 "lxc" | "podman"
++    NEEDS_ROOT           does the *CLI* action need host root?
++    USES_SYSTEM_BUS      is the container service on the D-Bus system bus?
++
++    is_initialized(args) -> bool
++    setup_host(args)                   one-time host preparation (init/upgrade)
++    prepare_drivers(args)              binder/ashmem (and friends)
++    setup_host_services(args)          network, sensors, cgroup, ... for a session
++    teardown_host_services(args)       inverse of the above
++    prepare_session(args, session)     rootfs + per-session files
++    teardown_session(args)             inverse of the above
++    set_protocol(args)                 binder/AIDL protocol for this image
++    status(args) -> "RUNNING"|"FROZEN"|"STOPPED"
++    start(args, session) / stop(args) / freeze(args) / unfreeze(args)
++    shell(args) / logcat(args)
++
++Callers must never import a concrete backend directly; they ask
++`tools.helpers.runtime.get(args)` which resolves the active backend from the
++`container_backend` configuration key (bootstrapped via the WAYDROID_BACKEND
++environment variable, see name() below).
++
++See docs/rfc/rootless-backend.md for the full design.
++"""
++import logging
++import os
++
++import tools.config
++
++BACKENDS = ("lxc", "podman")
++
++
++def name(args):
++    """Return the active backend name.
++
++    The *bootstrap* answer comes from the WAYDROID_BACKEND environment variable,
++    because "which backend?" has to be answered before the config file -- whose
++    location can itself depend on the backend -- has been read.  Once a config
++    file exists, the persisted `container_backend` key is authoritative and the
++    environment variable is only used to seed it.
++    """
++    env = os.environ.get("WAYDROID_BACKEND")
++    if env:
++        return env
++    try:
++        cfg = tools.config.load(args)
++        backend = cfg["waydroid"].get("container_backend")
++        if backend:
++            return backend
++    except Exception as e:
++        logging.debug("Could not read container_backend from config: %s", e)
++    return "lxc"
++
++
++def get(args):
++    """Return the backend module for the active backend."""
++    backend = name(args)
++    if backend == "lxc":
++        from tools.helpers.runtime import lxc as module
++    elif backend == "podman":
++        from tools.helpers.runtime import podman as module
++    else:
++        raise RuntimeError("Unknown container backend: {}".format(backend))
++    return module
++
++
++def needs_root(args):
++    return get(args).NEEDS_ROOT
++
++
++def uses_system_bus(args):
++    return get(args).USES_SYSTEM_BUS
++
++
++def is_initialized(args):
++    return get(args).is_initialized(args)
++
++
++def host_binder(args):
++    """True when this backend leaves the host able to reach Android's service
++    manager over /dev/binder.
++
++    The rootful LXC container always shares the host binder nodes; the rootless
++    podman backend only does so when podman_binderfs=\"host\".  When this is
++    False the gbinder-based session services (user monitor, clipboard,
++    notifications, hardware HAL) cannot work and are skipped.
++    """
++    return get(args).host_binder(args)
+diff --git a/tools/helpers/runtime/devstage.c b/tools/helpers/runtime/devstage.c
+new file mode 100644
+index 0000000..afc394f
+--- /dev/null
++++ b/tools/helpers/runtime/devstage.c
+@@ -0,0 +1,451 @@
++/*
++ * devstage.c - rootless stand-in for Android's init first stage.
++ *
++ * The container runs this as PID 1 and it then exec()s "/init second_stage".
++ * We start init at its second stage because the first stage is impossible in a
++ * rootless container: it mknod()s character devices and chmod()s /proc/cmdline,
++ * and the kernel checks CAP_MKNOD / CAP_FOWNER against the *initial* user
++ * namespace, which a rootless container can never satisfy.
++ *
++ * Everything else the first stage would have provided is supplied by podman
++ * (tmpfs on /dev, /proc, /sys, devpts, /dev/null, /dev/urandom, ...) or by
++ * run.sh bind mounts, with five exceptions that we do here:
++ *
++ *   - the binder devices, because Android's init does not know about binderfs
++ *     (Waydroid instead bind-mounts the host's /dev/binder*, which needs host
++ *     root).  binderfs exists precisely so that unprivileged user namespaces
++ *     can get their own binder devices: the filesystem carries FS_USERNS_MOUNT,
++ *     and nodes are created by the BINDER_CTL_ADD ioctl on
++ *     <mount>/binder-control instead of by mknod (which needs CAP_MKNOD in the
++ *     initial userns).
++ *
++ *   - the tmpfs on /mnt, see setup_mnt_tmpfs() below.
++ *
++ *   - a writable /proc/sys, see setup_proc_sys() below.
++ *
++ *   - a writable /sys/fs/cgroup, see setup_cgroup_rw() below.
++ *
++ *   - /dev/input, see setup_dev_input() below.
++ */
++
++#define _GNU_SOURCE
++#include <errno.h>
++#include <fcntl.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/mount.h>
++#include <sys/stat.h>
++#include <sys/statvfs.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++/* <linux/android/binderfs.h> */
++struct binderfs_device {
++    char name[256];
++    uint32_t major;
++    uint32_t minor;
++};
++#define BINDER_CTL_ADD _IOWR('b', 1, struct binderfs_device)
++
++static const char *const BINDER_NODES[] = {"binder", "hwbinder", "vndbinder"};
++#define N_NODES (sizeof(BINDER_NODES) / sizeof(*BINDER_NODES))
++
++static void setup_binderfs(void) {
++    if (access("/dev/binder", F_OK) == 0) { /* already provided */
++        return;
++    }
++
++    if (mkdir("/dev/binderfs", 0755) != 0 && errno != EEXIST) {
++        fprintf(stderr, "devstage: mkdir /dev/binderfs: %s\n", strerror(errno));
++    }
++    if (mount("binder", "/dev/binderfs", "binder", 0, NULL) != 0) {
++        fprintf(stderr, "devstage: mount binderfs failed: %s\n", strerror(errno));
++        return;
++    }
++
++    int ctl = open("/dev/binderfs/binder-control", O_RDONLY | O_CLOEXEC);
++    if (ctl < 0) {
++        fprintf(stderr, "devstage: open binder-control: %s\n", strerror(errno));
++    } else {
++        for (size_t i = 0; i < N_NODES; i++) {
++            struct binderfs_device dev;
++            memset(&dev, 0, sizeof(dev));
++            snprintf(dev.name, sizeof(dev.name), "%s", BINDER_NODES[i]);
++            if (ioctl(ctl, BINDER_CTL_ADD, &dev) != 0 && errno != EEXIST) {
++                fprintf(stderr, "devstage: BINDER_CTL_ADD %s: %s\n", dev.name,
++                        strerror(errno));
++            }
++        }
++        close(ctl);
++    }
++
++    for (size_t i = 0; i < N_NODES; i++) {
++        char target[64], link[64];
++        snprintf(target, sizeof(target), "/dev/binderfs/%s", BINDER_NODES[i]);
++        snprintf(link, sizeof(link), "/dev/%s", BINDER_NODES[i]);
++        /* binderfs creates the nodes 0600 root:root; AOSP's ueventd.rc makes
++         * them world read/write, and it must, because servicemanager,
++         * hwservicemanager and vndservicemanager all run as uid 1000 and would
++         * otherwise fail to open the driver (and then nothing ever becomes the
++         * binder context manager). */
++        if (chmod(target, 0666) != 0) {
++            fprintf(stderr, "devstage: chmod %s: %s\n", target, strerror(errno));
++        }
++        unlink(link);
++        if (symlink(target, link) != 0) {
++            fprintf(stderr, "devstage: symlink %s: %s\n", link, strerror(errno));
++        }
++    }
++
++    /*
++     * Waydroid bind-mounts the *host's* /dev/hwbinder onto /dev/host_hwbinder
++     * (tools/helpers/lxc.py) and refuses to start if that fails, because its
++     * patched libhidlbase has a second, "host" service manager:
++     * defaultServiceManager1_2(bool), ProcessState::self(bool) and
++     * getRawServiceInternal(..., bool) all take an isHost flag, and the vendor
++     * Waydroid HALs (vendor.waydroid.display/window/clipboard) consult it.  A
++     * rootless container has no host hwbinder to bind -- binderfs is exactly
++     * the mechanism that lets us have our own -- and for Waydroid the two
++     * paths are only ever two names for one binder instance, so point
++     * host_hwbinder at our own hwbinder node.
++     */
++    unlink("/dev/host_hwbinder");
++    if (symlink("/dev/binderfs/hwbinder", "/dev/host_hwbinder") != 0) {
++        fprintf(stderr, "devstage: symlink /dev/host_hwbinder: %s\n",
++                strerror(errno));
++    }
++}
++
++/*
++ * Android's first stage mounts a tmpfs on /mnt (SetupMountNamespaces() in
++ * system/core/init/mount_namespace.cpp):
++ *
++ *     mount("tmpfs", "/mnt", "tmpfs",
++ *           MS_NOEXEC | MS_NOSUID | MS_NODEV, "mode=0755,uid=0,gid=1000")
++ *
++ * We need it for a reason beyond fidelity.  /mnt is where zygote prepares the
++ * per-user storage directories for the processes it forks, and it does that
++ * with fs_prepare_dir() = mkdir() + chown() + chmod():
++ *
++ *     PrepareDir("/mnt/user/0", 0710, AID_SHELL, AID_EVERYBODY)
++ *
++ * Our container root is a fuse-overlayfs.  FUSE filesystems cannot be
++ * idmapped-mount(), and a chown() to any uid other than the caller's own is
++ * checked with capable_wrt_inode_uidgid() against the superblock's user
++ * namespace, which for a FUSE mount is the *initial* one.  So the chown()
++ * fails with EPERM and the fork of system_server dies:
++ *
++ *     JNI FatalError called: (system_server) ... Zygote.cpp:769:
++ *       fs_prepare_dir failed on /mnt/user/0: Operation not permitted
++ *
++ * A tmpfs is mounted from inside this user namespace, so its superblock
++ * belongs to us (and it is memory backed, so there is nothing below to
++ * delegate the chown() to) and every uid mapped into the container works.
++ */
++static void setup_mnt_tmpfs(void) {
++    if (mount("tmpfs", "/mnt", "tmpfs", MS_NOEXEC | MS_NOSUID | MS_NODEV,
++              "mode=0755,uid=0,gid=1000") != 0) {
++        fprintf(stderr, "devstage: mount tmpfs /mnt: %s\n", strerror(errno));
++        return;
++    }
++    if (chmod("/mnt", 0755) != 0) {
++        fprintf(stderr, "devstage: chmod /mnt: %s\n", strerror(errno));
++    }
++}
++
++/*
++ * /proc/sys is mounted read-only by podman/crun.  Android's netd writes IPv6
++ * sysctls there while bringing an interface up -- IpClient calls disableIpv6(),
++ * setAcceptRa() and setIpv6PrivacyExtensions() before it ever reaches the DHCP
++ * state machine -- and when those writes fail with EROFS, IpClient aborts
++ * provisioning ("onProvisioningFailure(): 5") in a tight retry loop, so eth0
++ * never gets a lease.
++ *
++ * The proc superblock was mounted by podman inside our own user namespace, so
++ * we hold CAP_SYS_ADMIN over it and can lift the read-only bit ourselves.  Only
++ * the network sysctls become usable in practice: the global ones under
++ * /proc/sys/kernel/... are checked against the initial user namespace and still
++ * return EPERM.
++ */
++static void setup_proc_sys(void) {
++    if (mount("proc", "/proc/sys", "proc",
++              MS_REMOUNT | MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) != 0) {
++        fprintf(stderr, "devstage: remount /proc/sys rw: %s\n", strerror(errno));
++    }
++}
++
++/*
++ * Android's init needs a writable cgroupfs: it creates /sys/fs/cgroup/uid_N and
++ * pid_N for every service it starts.
++ *
++ * run.sh asks podman for that explicitly with "--security-opt
++ * unmask=/sys/fs/cgroup", which is podman's own switch for it:
++ *
++ *     pkg/specgen/generate/oci_linux.go: getCgroupPermissions(unmask) returns
++ *     "rw" when unmask contains "/sys/fs/cgroup" (or is "ALL"), "ro" otherwise,
++ *     and SpecGenToOCI() puts that in the OCI spec's cgroup mount.
++ *
++ * With it the mount is rw from the start and this function returns immediately
++ * (statvfs check below); it exists as an idempotent fallback for podman builds
++ * or hosts whose spec still says "ro".
++ *
++ * Without the flag the OCI spec mounts /sys/fs/cgroup with "ro" in its option
++ * list -- podman does that for rootless containers whatever --cgroupns and
++ * --cgroups say, see the config.json of such a container:
++ *
++ *     {"destination": "/sys/fs/cgroup", "type": "cgroup", "source": "cgroup",
++ *      "options": ["rprivate", "nosuid", "noexec", "nodev", "relatime", "ro"]}
++ *
++ * crun does not mount cgroup2 itself then: cgroup2 carries FS_USERNS_MOUNT and
++ * would work in our user namespace, but a cgroup2 mount already exists at that
++ * path (podman's), and stacking a second one fails with EBUSY (or EPERM
++ * without CAP_SYS_ADMIN).  do_mount_cgroup_v2() (libcrun/linux.c) falls back to
++ * bind mounting the *container's own cgroup directory* over the target while
++ * keeping the spec's flags, "ro" included, which is what we see:
++ *
++ *     cgroup2 /sys/fs/cgroup cgroup2 ro,nosuid,nodev,noexec,nsdelegate,...
++ *
++ * init's cgroup setup then fails for every service it starts, twice per
++ * service, 88 times of each in a single boot:
++ *
++ *     libprocessgroup: Failed to make and chown /sys/fs/cgroup/uid_1000:
++ *                      Read-only file system
++ *     init: createProcessGroup(1000, 118) failed for service 'surfaceflinger':
++ *                      Read-only file system
++ *
++ * and those two messages are not just noise: Service::Start() (init/
++ * service.cpp) treats a failing createProcessGroup() as a failed start and
++ * reports it to its caller as one.  With the mount writable, init creates and
++ * owns its uid_/pid_ directories as on any other machine and both messages
++ * disappear.
++ *
++ * The read-only bit is a per-mount flag, not a property of the filesystem: the
++ * cgroup2 superblock is writable, and the directory crun bound over the mount
++ * point is the container's own cgroup, which our uid 0 owns (podman creates the
++ * scope with the uid that runs podman).  Binding that mount on top of itself and
++ * remounting it without MS_RDONLY gives the writable view back -- the same
++ * operation crun's fallback performs, minus the flag.  Only a bind remount can
++ * lift it: remounting the inherited mount directly is refused with EPERM,
++ * because the mount was created in the parent user namespace, and every write
++ * to it needs CAP_SYS_ADMIN, which run.sh adds for init's benefit anyway.
++ *
++ * Two things stay broken, because neither can be repaired from inside a
++ * container on a cgroup-v2-only host: the cgroup v1 hierarchies Android expects
++ * at /dev/{memcg,cpuctl,cpuset,stune,blkio} (the controllers are all bound to
++ * the unified hierarchy, so mount() fails with EPERM/ENODEV), and the
++ * activation of the freezer controller through
++ * /sys/fs/cgroup/cgroup.subtree_control, which stays EBUSY as long as init
++ * itself runs in the namespace root cgroup.  Neither is needed to boot: the
++ * only cgroup files init really uses are the uid_/pid_ directories under
++ * /sys/fs/cgroup, and those are the same ones this function can repair.
++ */
++static void setup_cgroup_rw(void) {
++    struct statvfs vfs;
++
++    /* With run.sh's "--security-opt unmask=/sys/fs/cgroup" the mount is already
++     * writable and there is nothing to do. */
++    if (statvfs("/sys/fs/cgroup", &vfs) == 0 && !(vfs.f_flag & ST_RDONLY)) {
++        return;
++    }
++
++    if (mount("/sys/fs/cgroup", "/sys/fs/cgroup", NULL, MS_BIND, NULL) != 0) {
++        fprintf(stderr, "devstage: bind /sys/fs/cgroup: %s\n", strerror(errno));
++        return;
++    }
++    /* MS_REMOUNT | MS_BIND *without* MS_RDONLY.  The other flags have to be
++     * restated: a bind remount drops every flag it is not told to keep. */
++    if (mount(NULL, "/sys/fs/cgroup", NULL,
++              MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) != 0) {
++        fprintf(stderr, "devstage: remount /sys/fs/cgroup rw: %s\n",
++                strerror(errno));
++    }
++}
++
++/*
++ * Waydroid's hwcomposer is an ordinary Wayland client of the host compositor:
++ * it owns the Android window, so the compositor sends it the keyboard, pointer
++ * and touch events for whoever is focused on that window.  It hands those to
++ * Android by writing struct input_event's into four FIFOs:
++ *
++ *     /dev/input/wl_{keyboard,pointer,tablet,touch}_events
++ *
++ * hwcomposer (mkfifo() is one of its imported libc symbols) creates the pipes
++ * and opens the one for each device the seat advertises; the reader is
++ * Waydroid's patched InputReader (libinputreader.so, linked into system_server),
++ * which opens them like ordinary evdev nodes and polls them.  No kernel input
++ * device is involved, which is exactly what we want here: the events are scoped
++ * to our window instead of mirroring the whole host.
++ *
++ * Both ends run as uid 1000 inside the container (hwcomposer is "user host",
++ * system_server is "system"), so all that is missing is the directory itself.
++ * Android would normally get it from ueventd -- ueventd.rc has
++ *
++ *     subsystem input
++ *     dirname /dev/input
++ *
++ * -- but ueventd only acts on kernel uevents, and the kernel broadcasts those
++ * to the initial network namespace only, while podman puts us in a netns of our
++ * own for pasta.  Without it hwcomposer's mkfifo() fails with ENOENT, the open
++ * right after it follows suit, and it logs
++ *
++ *     hwcomposer: Failed to open pipe to InputFlinger: No such file or directory
++ *
++ * for every event, so nothing ever reaches Android's input stack.
++ *
++ * The directory existing is not enough on its own: init must not be watching
++ * it.  The LineageOS system_ext rc declares a keychord, and one keychord is all
++ * init/keychords.cpp needs to arm an inotify watch on /dev/input and to open
++ * every entry in it with a *blocking* open(O_RDONLY) -- which on the tablet
++ * FIFO (no writer on a desktop seat) hangs init's main loop for good.  run.sh
++ * therefore binds in a copy of that rc without its keycodes line; see the
++ * "init's keychord watcher and /dev/input" comment there.
++ *
++ * 0777 (the mkdir mode is masked, hence the explicit chmod) because neither end
++ * runs as root: hwcomposer has to create the FIFOs here and both ends have to
++ * open them.
++ */
++static void setup_dev_input(void) {
++    if (mkdir("/dev/input", 0777) != 0 && errno != EEXIST) {
++        fprintf(stderr, "devstage: mkdir /dev/input: %s\n", strerror(errno));
++        return;
++    }
++    if (chmod("/dev/input", 0777) != 0) {
++        fprintf(stderr, "devstage: chmod /dev/input: %s\n", strerror(errno));
++    }
++}
++
++/*
++ * FALLBACK ONLY -- see "netd's rtnetlink UID ranges" in run.sh for the real
++ * fix.  netd programs Android's per-UID routing policy over rtnetlink, and the
++ * kernel rejects the rules it needs:
++ *
++ *     E netd: Error adding IPv4 rule: Invalid argument
++ *     W ConnectivityService: Exception adding interface: ... Invalid argument (code 22)
++ *     E ConnectivityService: Exception in networkAddRouteParcel ...: No such device (code 19)
++ *
++ * The rejected messages carry FRA_UID_RANGE attributes whose endpoints come
++ * from ConnectivityService -- 0..INT_MAX for the default network -- and the
++ * kernel validates both endpoints with make_kuid(current_user_ns(), ...)
++ * before accepting the rule (fib_rules.c: unmapped endpoint -> INVALID_UID ->
++ * -EINVAL).  A rootless container whose user namespace is only 64k UIDs wide
++ * therefore cannot install *any* of the per-UID rules, and with no rule
++ * pointing at them the tables that should hold the routes stay empty.
++ *
++ * (netd's tc/eBPF/iptables setup fails the same way.)  eth0 still gets its
++ * DHCP lease, so ConnectivityService reports CONNECTED with INTERNET and a
++ * synthetic default route, and yet the kernel has no route at all: netd's rule
++ * set ends in
++ *
++ *     32000:  from all unreachable
++ *
++ * Everything fails with ENETUNREACH -- including DNS, where netd's resolver
++ * tags its query socket with a mark that matches none of the rules but the
++ * unreachable one, which is why name lookups die with ENONET even though the
++ * interface is up.
++ *
++ * With a user namespace wide enough to cover uid 2147483647, netd's rules are
++ * accepted, it installs the default route into table 1002 by itself and this
++ * function is never called (run.sh leaves WD_GATEWAY empty).  It remains for
++ * hosts that cannot widen /etc/subuid.  It gives the kernel a last-resort rule
++ * into the main table and puts the real default route there, so traffic whose
++ * mark walks off the end of netd's rules still gets out.
++ *
++ *     ip rule add pref 31000 from all lookup main
++ *     ip route replace default via <gw> dev eth0
++ *
++ * The gateway is the host's own default gateway: pasta hands the container the
++ * host's address, gateway and DNS server, and run.sh passes the gateway in
++ * WD_GATEWAY.  We also seed table 97 ("local_network"), which Android's own
++ * rules already point at, so the ordinary app path keeps working by itself.
++ *
++ * The commands are re-run for a while: netd installs its rules and flushes the
++ * tables it owns when the network comes up, a few seconds after we start, so
++ * anything installed before that is discarded.  Two minutes is plenty -- once
++ * netd has brought the network up it leaves the routing alone.
++ */
++#define NETFIX_ROUTE_TABLE_LOCAL_NETWORK "97"
++#define NETFIX_RULE_PRIORITY "31000"
++
++static int run_ip(char *const argv[]) {
++    pid_t pid = fork();
++    if (pid == 0) {
++        execv("/system/bin/ip", argv);
++        _exit(127);
++    }
++    if (pid < 0) {
++        return -1;
++    }
++    int status = 0;
++    if (waitpid(pid, &status, 0) < 0) {
++        return -1;
++    }
++    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
++}
++
++static void netfix(void) {
++    const char *gw = getenv("WD_GATEWAY");
++    if (gw == NULL || *gw == '\0') {
++        return;
++    }
++
++    /* "File exists" (our rule) and "Network is unreachable" (eth0 has no
++     * address yet) are both expected while we wait; keep them out of the log. */
++    int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
++    if (devnull >= 0) {
++        dup2(devnull, STDERR_FILENO);
++        if (devnull > STDERR_FILENO) {
++            close(devnull);
++        }
++    }
++
++    int ok = 0;
++    for (int i = 0; i < 60; i++) {
++        char *rule[] = {"ip", "rule", "add", "pref", NETFIX_RULE_PRIORITY,
++                        "from", "all", "lookup", "main", NULL};
++        char *route[] = {"ip", "route", "replace", "default", "via", (char *)gw,
++                         "dev", "eth0", "onlink", NULL};
++        char *local[] = {"ip", "route", "replace", "default", "via", (char *)gw,
++                         "dev", "eth0", "table",
++                         NETFIX_ROUTE_TABLE_LOCAL_NETWORK, "onlink", NULL};
++        (void)run_ip(rule);
++        ok = run_ip(route) == 0;
++        (void)run_ip(local);
++        usleep(2 * 1000 * 1000);
++    }
++
++    if (!ok) {
++        const char *msg = "<6>devstage: netfix: could not add the default route\n";
++        int kmsg = open("/dev/kmsg", O_WRONLY | O_APPEND | O_CLOEXEC);
++        if (kmsg >= 0) {
++            ssize_t ignored = write(kmsg, msg, strlen(msg));
++            (void)ignored;
++            close(kmsg);
++        }
++        fprintf(stderr, "devstage: netfix: could not add the default route\n");
++    }
++}
++
++int main(void) {
++    setup_binderfs();
++    setup_mnt_tmpfs();
++    setup_proc_sys();
++    setup_cgroup_rw();
++    setup_dev_input();
++
++    /*
++     * Hand the route repair to a child: netd's own routing is broken here (see
++     * netfix()), and the route cannot be installed before IpClient has the
++     * DHCP lease, which is long after init has taken over PID 1.
++     */
++    if (fork() == 0) {
++        netfix();
++        _exit(0);
++    }
++
++    execv("/init", (char *[]){(char *)"init", (char *)"second_stage", NULL});
++    fprintf(stderr, "devstage: execv /init: %s\n", strerror(errno));
++    return 1;
++}
+diff --git a/tools/helpers/runtime/lxc.py b/tools/helpers/runtime/lxc.py
+new file mode 100644
+index 0000000..de93d14
+--- /dev/null
++++ b/tools/helpers/runtime/lxc.py
+@@ -0,0 +1,236 @@
++# Copyright 2026 The Waydroid contributors
++# SPDX-License-Identifier: GPL-3.0-or-later
++"""
++LXC runtime backend.
++
++This is a thin adapter around the historical `tools/helpers/lxc.py` (kept as-is
++so nothing else breaks) plus the host-side orchestration that used to live
++inline in `tools/actions/container_manager.py` (driver preparation, the network
++script, sensors, cgroup/NFC hacks, host permission fix-ups).  None of that is
++LXC-specific in principle, but in practice it is what the rootful runtime needs,
++so it belongs here rather than in the generic container manager.
++"""
++import glob
++import logging
++import os
++from contextlib import suppress
++from shutil import which
++
++import tools.config
++import tools.helpers.run
++from tools import helpers
++from tools.helpers import lxc as _lxc
++
++
++NAME = "lxc"
++NEEDS_ROOT = True
++USES_SYSTEM_BUS = True
++
++
++def is_initialized(args):
++    return os.path.isfile(args.config) and os.path.isdir(tools.config.defaults["rootfs"])
++
++
++def host_binder(args):
++    # The rootful LXC container always uses the host binder nodes.
++    return True
++
++
++# --- one-time host preparation (init / upgrade) ---------------------------
++
++def setup_host(args):
++    helpers.drivers.loadBinderNodes(args)
++    _lxc.setup_host_perms(args)
++    _lxc.set_lxc_config(args)
++    _lxc.make_base_props(args)
++
++
++# --- binder / ashmem ------------------------------------------------------
++
++def set_permissions(args, perm_list=None, mode="777"):
++    def chmod(path, mode):
++        if os.path.exists(path):
++            command = ["chmod", mode, "-R", path]
++            tools.helpers.run.user(args, command, check=False)
++
++    # Nodes list
++    if not perm_list:
++        perm_list = [
++            "/dev/ashmem",
++
++            # sw_sync for HWC
++            "/dev/sw_sync",
++            "/sys/kernel/debug/sync/sw_sync",
++
++            # Media
++            "/dev/Vcodec",
++            "/dev/MTK_SMI",
++            "/dev/mdp_sync",
++            "/dev/mtk_cmdq",
++
++            # Graphics
++            "/dev/graphics",
++            "/dev/pvr_sync",
++            "/dev/ion",
++        ]
++
++        # DRM render nodes
++        perm_list.extend(glob.glob("/dev/dri/renderD*"))
++        # Framebuffers
++        perm_list.extend(glob.glob("/dev/fb*"))
++        # Videos
++        perm_list.extend(glob.glob("/dev/video*"))
++        # DMA-BUF Heaps
++        perm_list.extend(glob.glob("/dev/dma_heap/*"))
++
++    for path in perm_list:
++        chmod(path, mode)
++
++
++prepared_drivers = False
++
++
++def prepare_drivers(args):
++    global prepared_drivers
++    if prepared_drivers:
++        return
++
++    # Load binder and ashmem drivers
++    cfg = tools.config.load(args)
++    if cfg["waydroid"]["vendor_type"] == "MAINLINE":
++        if helpers.drivers.probeBinderDriver(args) != 0:
++            logging.error("Failed to load Binder driver")
++        helpers.drivers.probeAshmemDriver(args)
++    helpers.drivers.loadBinderNodes(args)
++    set_permissions(args, [
++        "/dev/" + args.BINDER_DRIVER,
++        "/dev/" + args.VNDBINDER_DRIVER,
++        "/dev/" + args.HWBINDER_DRIVER
++    ], "666")
++    prepared_drivers = True
++
++
++# --- per-session host services --------------------------------------------
++
++def setup_host_services(args):
++    # Networking
++    command = [tools.config.tools_src +
++               "/data/scripts/waydroid-net.sh", "start"]
++    tools.helpers.run.user(args, command)
++
++    # Sensors
++    if which("waydroid-sensord"):
++        tools.helpers.run.user(
++            args, ["waydroid-sensord", "/dev/" + args.HWBINDER_DRIVER], output="background")
++
++    # Cgroup hacks
++    if which("start"):
++        command = ["start", "cgroup-lite"]
++        tools.helpers.run.user(args, command, check=False)
++
++    # Keep schedtune around in case nesting is supported
++    if os.path.ismount("/sys/fs/cgroup/schedtune"):
++        try:
++            os.mkdir("/sys/fs/cgroup/schedtune/probe0")
++            os.mkdir("/sys/fs/cgroup/schedtune/probe0/probe1")
++        except OSError:
++            command = ["umount", "-l", "/sys/fs/cgroup/schedtune"]
++            tools.helpers.run.user(args, command, check=False)
++        finally:
++            if os.path.exists("/sys/fs/cgroup/schedtune/probe0/probe1"):
++                os.rmdir("/sys/fs/cgroup/schedtune/probe0/probe1")
++            if os.path.exists("/sys/fs/cgroup/schedtune/probe0"):
++                os.rmdir("/sys/fs/cgroup/schedtune/probe0")
++
++    # TODO: remove NFC hacks
++    if which("stop"):
++        command = ["stop", "nfcd"]
++        tools.helpers.run.user(args, command, check=False)
++    elif which("systemctl") and (tools.helpers.run.user(args, ["systemctl", "is-active", "-q", "nfcd"], check=False) == 0):
++        command = ["systemctl", "stop", "nfcd"]
++        tools.helpers.run.user(args, command, check=False)
++
++    # Set permissions
++    set_permissions(args)
++
++
++def teardown_host_services(args):
++    # Networking
++    command = [tools.config.tools_src +
++               "/data/scripts/waydroid-net.sh", "stop"]
++    tools.helpers.run.user(args, command, check=False)
++
++    # TODO: remove NFC hacks
++    if which("start"):
++        command = ["start", "nfcd"]
++        tools.helpers.run.user(args, command, check=False)
++    elif which("systemctl") and (tools.helpers.run.user(args, ["systemctl", "is-enabled", "-q", "nfcd"], check=False) == 0):
++        command = ["systemctl", "start", "nfcd"]
++        tools.helpers.run.user(args, command, check=False)
++
++    # Sensors
++    if which("waydroid-sensord"):
++        command = ["pidof", "waydroid-sensord"]
++        pid = tools.helpers.run.user(args, command, check=False, output_return=True).strip()
++        if pid:
++            command = ["kill", "-9", pid]
++            tools.helpers.run.user(args, command, check=False)
++
++
++# --- per-session files ----------------------------------------------------
++
++def prepare_session(args, session):
++    # Create session-specific LXC config file
++    _lxc.generate_session_lxc_config(args, session)
++    # Backwards compatibility
++    with open(tools.config.defaults["lxc"] + "/waydroid/config") as f:
++        if "config_session" not in f.read():
++            helpers.mount.bind(args, session["waydroid_data"],
++                               tools.config.defaults["data"])
++
++    # Mount rootfs
++    cfg = tools.config.load(args)
++    helpers.images.mount_rootfs(args, cfg["waydroid"]["images_path"], session)
++
++
++def teardown_session(args):
++    # Umount rootfs
++    helpers.images.umount_rootfs(args)
++
++    # Backwards compatibility
++    with suppress(Exception):
++        helpers.mount.umount_all(args, tools.config.defaults["data"])
++
++
++def set_protocol(args):
++    helpers.protocol.set_aidl_version(args)
++
++
++# --- lifecycle ------------------------------------------------------------
++
++def status(args):
++    return _lxc.status(args)
++
++
++def start(args, session):
++    _lxc.start(args)
++
++
++def stop(args):
++    _lxc.stop(args)
++
++
++def freeze(args):
++    _lxc.freeze(args)
++
++
++def unfreeze(args):
++    _lxc.unfreeze(args)
++
++
++def shell(args):
++    _lxc.shell(args)
++
++
++def logcat(args):
++    _lxc.logcat(args)
+diff --git a/tools/helpers/runtime/podman.py b/tools/helpers/runtime/podman.py
+new file mode 100644
+index 0000000..56e1a68
+--- /dev/null
++++ b/tools/helpers/runtime/podman.py
+@@ -0,0 +1,989 @@
++# Copyright 2026 The Waydroid contributors
++# SPDX-License-Identifier: GPL-3.0-or-later
++"""
++Rootless podman runtime backend.
++
++This is the Python port of waydroid-rootless/run.sh: it boots the already
++installed Waydroid Android image inside an unprivileged podman container instead
++of Waydroid's rootful LXC runtime.  Every flag/probe that run.sh accumulated
++lives here as an explicit `podman run` argument list plus a handful of host
++files that are bind-mounted over the Android tree.
++
++Host prerequisites (all satisfied by an ordinary user except where noted):
++
++  * >= 131072 uids/gids in /etc/subuid and /etc/subgid, so Android's netd can
++    install its 0..INT_MAX per-UID routing rules.  Without them the backend
++    falls back to --userns=keep-id and devstage repairs the routing itself.
++  * podman/crun and pasta.
++  * a C compiler, to build the tiny static devstage/wd-broker stubs on first
++    use.  The binder fd broker (wd-broker.c) is what lets the *host* reach
++    Android's service manager despite binderfs being container-local.
++
++See docs/rfc/rootless-backend.md for the full rationale, and
++waydroid-rootless/run.sh for the commented original.
++"""
++import glob
++import logging
++import os
++import pwd
++import re
++import shutil
++import socket
++import stat
++import subprocess
++import sys
++import time
++from contextlib import suppress
++from shutil import which
++
++import tools.config
++import tools.helpers.run
++from tools import helpers
++from tools.helpers.lxc import ANDROID_ENV
++
++
++NAME = "podman"
++NEEDS_ROOT = False
++USES_SYSTEM_BUS = False
++
++# Android's own uid/gid space is 0..99999 and AID_USER_OFFSET puts the next user
++# at 100000..199999, so 2^18 covers it twice over.  Mapping more is pointless
++# (see run.sh "netd's rtnetlink UID ranges").
++MAP_CAP = 131072
++INT_MAX = 2147483647
++
++# Capabilities Waydroid's LXC config grants and Android's init needs that are
++# not already in rootless podman's default set.  See run.sh for the details.
++CAPS = [
++    "sys_admin", "sys_ptrace", "sys_nice", "sys_resource", "syslog",
++    "net_admin", "net_raw", "dac_read_search", "ipc_lock", "block_suspend",
++    "wake_alarm", "audit_control",
++]
++
++
++# --- config helpers -------------------------------------------------------
++
++def _cfg(args):
++    return tools.config.load(args)
++
++
++def _name(cfg):
++    return cfg["waydroid"].get("podman_name") or "waydroid"
++
++
++def _image(args, cfg):
++    return cfg["waydroid"].get("podman_image") or ""
++
++
++def _data_volume(cfg):
++    return cfg["waydroid"].get("podman_data_volume") or "waydroid-data"
++
++
++def _volume_mountpoint(name):
++    result = subprocess.run(
++        ["podman", "volume", "inspect", "-f", "{{.Mountpoint}}", name],
++        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
++    return result.stdout.strip() if result.returncode == 0 else ""
++
++
++def _ensure_data_volume(args, cfg):
++    name = _data_volume(cfg)
++    exists = subprocess.run(["podman", "volume", "exists", name],
++                            stdout=subprocess.DEVNULL,
++                            stderr=subprocess.DEVNULL)
++    if exists.returncode == 0:
++        return name
++    result = subprocess.run(["podman", "volume", "create", name],
++                            stdout=subprocess.DEVNULL,
++                            stderr=subprocess.DEVNULL)
++    if result.returncode != 0:
++        raise RuntimeError("could not create podman volume {}".format(name))
++    return name
++
++
++def _data_dir(args, cfg):
++    """Host mountpoint of the named /data volume."""
++    name = _ensure_data_volume(args, cfg)
++    mountpoint = _volume_mountpoint(name)
++    if not mountpoint:
++        raise RuntimeError("could not inspect podman volume {}".format(name))
++    return mountpoint
++
++
++def _storage_driver():
++    result = subprocess.run(
++        ["podman", "info", "--format", "{{.Store.GraphDriverName}}"],
++        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
++    return result.stdout.strip() if result.returncode == 0 else "unknown"
++
++
++def _storage_options():
++    result = subprocess.run(
++        ["podman", "info", "--format", "{{json .Store.GraphOptions}}"],
++        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
++    return result.stdout.strip() if result.returncode == 0 else ""
++
++
++def _work_tmp(args):
++    return args.work + "/tmp"
++
++
++def _ensure_cfg_args(args, cfg):
++    """Populate the args attributes make_base_props()/images.get() expect.
++
++    On the CLI those are only set by 'waydroid init'/'upgrade'; a plain
++    'container start' has to recover them from the config file.
++    """
++    for arg, key, default in (
++            ("vendor_type", "vendor_type", "MAINLINE"),
++            ("images_path", "images_path", tools.config.defaults["images_path"]),
++            ("system_ota", "system_ota", "None"),
++            ("vendor_ota", "vendor_ota", "None")):
++        if not getattr(args, arg, None):
++            setattr(args, arg, cfg["waydroid"].get(key) or default)
++
++
++# --- uid/gid mapping ------------------------------------------------------
++
++def _subid_block(kind):
++    """Return (host_start, count, intermediate_start) for the best matching
++    /etc/sub<kind>id block, or None.  Port of run.sh's subid_block()."""
++    lines = []
++    paths = ["/etc/sub{}id".format(kind)]
++    paths += sorted(glob.glob("/etc/sub{}id.d/*".format(kind)))
++    for path in paths:
++        with suppress(OSError):
++            with open(path) as f:
++                lines.extend(f.readlines())
++
++    user = pwd.getpwuid(os.getuid()).pw_name
++    uid = str(os.getuid())
++    count = 0
++    host_start = 0
++    inter_off = 0
++    inter = 0
++    for line in lines:
++        parts = line.strip().split(":")
++        if len(parts) < 3 or (parts[0] != user and parts[0] != uid):
++            continue
++        try:
++            n = int(parts[2])
++        except ValueError:
++            continue
++        if n > 0:
++            if n > count:
++                count = n
++                host_start = int(parts[1])
++                inter_off = inter + 1
++            inter += n
++    if not count:
++        return None
++    return host_start, count, inter_off
++
++
++def _cap_count(n):
++    return MAP_CAP if n > MAP_CAP else n
++
++
++def _userns_opts(args, cfg):
++    """Return (podman options, derived) for the user namespace."""
++    # WD_USENS is the run.sh A/B escape hatch and wins over the config.
++    mode = os.environ.get("WD_USENS") or cfg["waydroid"].get("podman_uid_map") or "auto"
++    if mode == "keep-id":
++        return ["--userns=keep-id:uid=0,gid=0"], False
++    if mode != "auto":
++        return ["--userns=" + mode], False
++
++    ub = _subid_block("u")
++    gb = _subid_block("g")
++    if ub and gb and ub[1] > 1 and gb[1] > 1:
++        un = _cap_count(ub[1])
++        gn = _cap_count(gb[1])
++        opts = [
++            "--uidmap", "0:0:1",
++            "--uidmap", "1:{}:{}".format(ub[2], un - 1),
++            "--uidmap", "{}:{}:1".format(INT_MAX, ub[2] + un - 1),
++            "--gidmap", "0:0:1",
++            "--gidmap", "1:{}:{}".format(gb[2], gn - 1),
++            "--gidmap", "{}:{}:1".format(INT_MAX, gb[2] + gn - 1),
++        ]
++        logging.info(
++            "podman userns: container 0 -> host %s, 1..%s -> host %s..%s, "
++            "%s -> host %s",
++            os.getuid(), un - 1, ub[0], ub[0] + un - 2,
++            INT_MAX, ub[0] + un - 1)
++        if un < 131072:
++            logging.warning(
++                "/etc/subuid holds only %s uids, so Android uids above %s "
++                "(isolated processes) cannot be mapped", ub[1], un - 1)
++        return opts, True
++    return ["--userns=keep-id:uid=0,gid=0"], False
++
++
++def _userns_covers_int_max(kind):
++    """Only used on the keep-id fallback: does podman's own map reach INT_MAX?"""
++    with suppress(Exception):
++        out = subprocess.run(["podman", "unshare", "cat",
++                              "/proc/self/{}_map".format(kind)],
++                             capture_output=True, text=True).stdout
++        for line in out.splitlines():
++            fields = line.split()
++            if len(fields) >= 3 and int(fields[0]) + int(fields[2]) > INT_MAX:
++                return True
++    return False
++
++
++# --- host network probes --------------------------------------------------
++
++def _host_dns():
++    with suppress(Exception):
++        out = subprocess.run(["resolvectl", "status"],
++                             capture_output=True, text=True).stdout
++        for line in out.splitlines():
++            if "DNS Servers:" in line:
++                for tok in line.split()[2:]:
++                    if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", tok):
++                        return tok
++    return "10.0.0.1"
++
++
++def _default_iface():
++    with suppress(Exception):
++        out = subprocess.run(["ip", "route", "show", "default"],
++                             capture_output=True, text=True).stdout
++        for line in out.splitlines():
++            fields = line.split()
++            if len(fields) >= 5:
++                return fields[4]
++    return ""
++
++
++def _default_gateway():
++    with suppress(Exception):
++        out = subprocess.run(["ip", "route", "show", "default"],
++                             capture_output=True, text=True).stdout
++        for line in out.splitlines():
++            fields = line.split()
++            if len(fields) >= 3 and fields[1] == "via":
++                return fields[2]
++    return ""
++
++
++def _pasta_network(args, cfg, wrap_dir):
++    """Build the --network= value and, when needed, a PATH entry for the pasta
++    wrapper that drops podman's hard-coded --config-net."""
++    host_dns = _host_dns()
++    network = "pasta:-I,eth0,--dns={},--dhcp-dns".format(host_dns)
++    path_prefix = ""
++
++    config_net = (os.environ.get("WD_PASTA_CONFIG_NET")
++                  or cfg["waydroid"].get("podman_pasta_config_net"))
++    if not config_net:
++        # Without --config-net, pasta derives the advertised prefix from the
++        # host interface and picks the first address (often the ULA).  Pin the
++        # global one so netd's own SLAAC lands on a routable address.
++        iface = _default_iface() or "wlan0"
++        addr = ""
++        prefix_len = ""
++        with suppress(Exception):
++            out = subprocess.run(["ip", "-6", "route", "show", "dev", iface,
++                                  "proto", "ra"],
++                                 capture_output=True, text=True).stdout
++            for line in out.splitlines():
++                fields = line.split()
++                if fields and re.match(r"^[23]", fields[0]):
++                    prefix_len = fields[0].split("/")[-1]
++                    break
++        with suppress(Exception):
++            out = subprocess.run(["ip", "-6", "addr", "show", "dev", iface,
++                                  "scope", "global"],
++                                 capture_output=True, text=True).stdout
++            for line in out.splitlines():
++                fields = line.split()
++                if len(fields) >= 2 and re.match(r"^[23]", fields[1]):
++                    addr = fields[1].split("/")[0]
++                    break
++        if addr and prefix_len:
++            network += ",-a,{}/{}".format(addr, prefix_len)
++
++        pasta_real = which("pasta")
++        if pasta_real:
++            wrap = os.path.join(wrap_dir, "pasta-wrap")
++            os.makedirs(wrap, exist_ok=True)
++            wrapper = os.path.join(wrap, "pasta")
++            with open(wrapper, "w") as f:
++                f.write(
++                    "#!/usr/bin/env bash\n"
++                    "# generated by tools/helpers/runtime/podman.py - drop the\n"
++                    "# --config-net podman insists on adding so passt keeps\n"
++                    "# router advertisements enabled.\n"
++                    "args=()\n"
++                    'for a in "$@"; do\n'
++                    '  [[ "$a" == "--config-net" ]] || args+=("$a")\n'
++                    "done\n"
++                    'exec "{}" "${{args[@]}}"\n'.format(pasta_real))
++            os.chmod(wrapper, 0o755)
++            path_prefix = wrap
++
++    extra = cfg["waydroid"].get("podman_pasta_options")
++    if extra:
++        network += "," + extra
++    return network, path_prefix
++
++
++def _host_gateway(args, cfg, derived):
++    if derived or (_userns_covers_int_max("uid") and _userns_covers_int_max("gid")):
++        gateway = ""
++    else:
++        gateway = _default_gateway()
++        logging.warning(
++            "the rootless user namespace stops below uid %s, so the kernel "
++            "rejects netd's per-UID rules (EINVAL) and devstage's netfix() has "
++            "to repair the routing instead; configure a subuid/subgid block of "
++            "at least 131072 to let netd do it natively", INT_MAX)
++    # An explicit (even empty) WD_GATEWAY always wins over the probe.
++    if os.environ.get("WD_GATEWAY") is not None:
++        gateway = os.environ["WD_GATEWAY"]
++    return gateway
++
++
++# --- devices --------------------------------------------------------------
++
++def _device_opts(args, cfg):
++    opts = []
++
++    def add(src, dst=None):
++        if os.path.exists(src):
++            opts.extend(["--device", src + (":" + dst if dst else "")])
++
++    add("/dev/dri/renderD128")
++    add("/dev/dri/card0")
++    add("/dev/dma_heap/system")
++    add("/dev/fb0")
++    add("/dev/uhid")
++    add("/dev/fuse")
++    add("/dev/net/tun", "/dev/tun")
++
++    if cfg["waydroid"].get("podman_binderfs") == "host":
++        with suppress(Exception):
++            helpers.drivers.loadBinderNodes(args)
++        for drv, dst in ((getattr(args, "BINDER_DRIVER", None), "/dev/binder"),
++                         (getattr(args, "VNDBINDER_DRIVER", None), "/dev/vndbinder"),
++                         (getattr(args, "HWBINDER_DRIVER", None), "/dev/hwbinder")):
++            if drv:
++                add("/dev/" + drv, dst)
++    return opts
++
++
++def _socket_binds(args, cfg, session=None):
++    session = session or {}
++    binds = []
++
++    def param(key, fallback):
++        value = session.get(key)
++        if not value or value == "None":
++            return fallback
++        return value
++
++    xdg_runtime = param("xdg_runtime_dir",
++                        os.environ.get("XDG_RUNTIME_DIR")
++                        or "/run/user/{}".format(os.getuid()))
++    display = param("wayland_display", "wayland-0")
++    wayland = os.path.join(xdg_runtime, display)
++    with suppress(OSError):
++        if stat.S_ISSOCK(os.stat(wayland).st_mode):
++            os.chmod(wayland, 0o777)
++            binds += ["-v", "{}:/run/xdg/wayland-0".format(wayland)]
++    pulse = os.path.join(xdg_runtime, "pulse", "native")
++    if os.path.exists(pulse):
++        binds += ["-v", "{}:/run/xdg/pulse/native".format(pulse)]
++    return binds
++
++
++# --- host-side staging ----------------------------------------------------
++
++def _devstage(args):
++    """Ship build/compile the static PID-1 stub (see devstage.c)."""
++    binary = args.work + "/devstage"
++    source = os.path.join(os.path.dirname(os.path.realpath(__file__)), "devstage.c")
++    if (not os.path.exists(binary)
++            or os.path.getmtime(source) > os.path.getmtime(binary)):
++        logging.info("[podman] cc -static -o %s %s", binary, source)
++        tools.helpers.run.user(args, ["cc", "-O2", "-static", "-Wall", "-o",
++                                      binary, source])
++    return binary
++
++
++# --- host <-> container binder bridge ------------------------------------
++#
++# The container creates its own binderfs (devstage.c).  Those nodes live in the
++# container's mount namespace and cannot be reopened from the host by
++# major:minor, so the host reaches Android's servicemanager through a tiny
++# in-container helper (wd-broker.c) that opens the node and passes the fd over
++# a unix socket in a host-owned bind mount.  See docs/rfc/rootless-backend.md.
++
++_BINDER_PATHS = {}
++_BINDER_FDS = {}
++
++
++def _binder_dir(args):
++    return os.path.join(args.work, "tmp", "binder")
++
++
++def _broker_binary(args):
++    directory = _binder_dir(args)
++    os.makedirs(directory, exist_ok=True)
++    binary = os.path.join(directory, "wd-broker")
++    source = os.path.join(os.path.dirname(os.path.realpath(__file__)),
++                          "wd-broker.c")
++    if (not os.path.exists(binary)
++            or os.path.getmtime(source) > os.path.getmtime(binary)):
++        logging.info("[podman] cc -static -o %s %s", binary, source)
++        tools.helpers.run.user(args, ["cc", "-O2", "-static", "-Wall", "-o",
++                                      binary, source])
++    return binary
++
++
++def _container_running(cfg):
++    result = subprocess.run(
++        ["podman", "container", "inspect", "-f", "{{.State.Status}}",
++         _name(cfg)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
++        text=True)
++    return result.returncode == 0 and result.stdout.strip() == "running"
++
++
++def _container_id(cfg):
++    result = subprocess.run(
++        ["podman", "container", "inspect", "-f", "{{.Id}}", _name(cfg)],
++        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
++    if result.returncode == 0 and result.stdout.strip():
++        return result.stdout.strip()
++    return _name(cfg)
++
++
++def _acquire_binder_fd(args, cfg, dev):
++    """Ask the container to open /dev/binderfs/<dev> and receive the fd."""
++    name = _name(cfg)
++    _broker_binary(args)
++    sock_name = "{}-{}-{}.sock".format(dev, os.getpid(), time.time_ns())
++    sock = os.path.join(_binder_dir(args), sock_name)
++    with suppress(FileNotFoundError):
++        os.unlink(sock)
++
++    proc = subprocess.Popen(
++        ["podman", "exec", "-u", "0", name,
++         "/run/wd-binder/wd-broker", "/dev/binderfs/" + dev,
++         "/run/wd-binder/" + sock_name])
++    try:
++        deadline = time.time() + 15
++        while time.time() < deadline:
++            if os.path.exists(sock):
++                break
++            if proc.poll() is not None:
++                raise RuntimeError(
++                    "binder broker for {} exited with {}".format(
++                        dev, proc.returncode))
++            time.sleep(0.05)
++        else:
++            raise RuntimeError(
++                "binder broker for {} did not create {}".format(dev, sock))
++
++        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++        try:
++            conn.connect(sock)
++            _, fds, _, _ = socket.recv_fds(conn, 1, 1)
++        finally:
++            conn.close()
++    finally:
++        with suppress(Exception):
++            proc.terminate()
++        with suppress(Exception):
++            proc.wait(timeout=5)
++        with suppress(FileNotFoundError):
++            os.unlink(sock)
++
++    if not fds:
++        raise RuntimeError("no binder fd received for {}".format(dev))
++    return fds[0]
++
++
++def binder_device_paths(args):
++    """Return ("fd/N", ...) driver names for gbinder, or None.
++
++    Each process that talks to Android acquires its own fds; they are cached
++    for the lifetime of the process.  "/dev/" + "fd/N" is /dev/fd/N, which the
++    interfaces already pass to gbinder.ServiceManager().
++    """
++    cfg = _cfg(args)
++    if cfg["waydroid"].get("podman_binderfs") == "host":
++        return None
++    if not _container_running(cfg):
++        return None
++
++    key = _container_id(cfg)
++    cached = _BINDER_PATHS.get(key)
++    if cached and all(
++            os.path.exists("/proc/self/fd/" + p.split("/")[-1])
++            for p in cached):
++        return cached
++
++    # A recreated container has a new binder context; drop the old fds.
++    for old in _BINDER_FDS.pop(key, []):
++        with suppress(OSError):
++            os.close(old)
++    _BINDER_PATHS.pop(key, None)
++
++    fds = []
++    paths = []
++    for dev in ("binder", "vndbinder", "hwbinder"):
++        fd = _acquire_binder_fd(args, cfg, dev)
++        fds.append(fd)
++        paths.append("fd/{}".format(fd))
++
++    _BINDER_FDS[key] = fds          # keep the descriptors open
++    _BINDER_PATHS[key] = tuple(paths)
++    return _BINDER_PATHS[key]
++
++
++
++def _stage_host_files(args, cfg, tmp):
++    """Prepare the host files/sockets every run needs.  Returns
++    (binds, path_prefix) where path_prefix is prepended to PATH if needed."""
++    binds = []
++
++    # Android's first stage chmod("/proc/cmdline", 0440); bind a plain file.
++    cmdline = os.path.join(tmp, "cmdline")
++    if not os.path.exists(cmdline):
++        os.makedirs(os.path.dirname(cmdline), exist_ok=True)
++        with open("/proc/cmdline") as src, open(cmdline, "w") as dst:
++            dst.write(src.read())
++    binds += ["-v", "{}:/proc/cmdline".format(cmdline)]
++
++    # ueventd asks for 16 MB SO_RCVBUF and retries with SO_RCVBUFFORCE, which
++    # can never succeed rootless.  Request min(rmem_max, 16 MB) instead.
++    ueventd = os.path.join(tmp, "ueventd.rc")
++    try:
++        with open("/proc/sys/net/core/rmem_max") as f:
++            rmem = int(f.read().strip())
++    except (OSError, ValueError):
++        rmem = 16777216
++    if rmem > 16777216:
++        rmem = 16777216
++    os.makedirs(os.path.dirname(ueventd), exist_ok=True)
++    with open(ueventd, "w") as f:
++        f.write("uevent_socket_rcvbuf_size {}\n".format(rmem))
++    binds += ["-v", "{}:/vendor/ueventd.rc:ro".format(ueventd)]
++
++    # /dev/socket is created by mkdir() in the real first stage; it is a plain
++    # host directory here, so sweep leftovers that would make bind() fail.
++    dsock = os.path.join(tmp, "dev-socket")
++    os.makedirs(dsock, exist_ok=True)
++    for entry in os.listdir(dsock):
++        path = os.path.join(dsock, entry)
++        with suppress(OSError):
++            if os.path.isdir(path) and not os.path.islink(path):
++                shutil.rmtree(path)
++            else:
++                os.unlink(path)
++    binds += ["-v", "{}:/dev/socket".format(dsock)]
++    binds += ["-v", "{}:/devstage:ro".format(_devstage(args))]
++
++    return binds
++
++
++# --- the podman run command ----------------------------------------------
++
++def _build_run_cmd(args, session):
++    cfg = _cfg(args)
++    tmp = _work_tmp(args)
++    os.makedirs(tmp, exist_ok=True)
++
++    name = _name(cfg)
++    image = _image(args, cfg)
++    if not image:
++        raise RuntimeError("podman_image is required (OCI image)")
++
++    userns_opts, derived = _userns_opts(args, cfg)
++    network, path_prefix = _pasta_network(args, cfg, tmp)
++    gateway = _host_gateway(args, cfg, derived)
++
++    cmd = ["podman", "run", "-d", "--name", name]
++    cmd += userns_opts
++    cmd += ["--user", "0:0", "--hostname", "waydroid",
++            "--network=" + network,
++            "--env", "WD_GATEWAY=" + gateway,
++            "--cgroupns=private",
++            "--security-opt", "seccomp=unconfined",
++            "--security-opt", "label=disable"]
++
++    # Native podman publish: pasta forwards this host-loopback port to the
++    # container's adbd.  No custom pasta "-t" rewriting is needed.
++    adb_port = str(cfg["waydroid"].get("podman_adb_port") or "5555")
++    if re.match(r"^\d+$", adb_port) and adb_port != "0":
++        cmd += ["-p", "127.0.0.1:{}:5555".format(adb_port)]
++    if not (os.environ.get("WD_CGROUP_RO")
++            or cfg["waydroid"].get("podman_cgroup_ro")):
++        cmd += ["--security-opt", "unmask=/sys/fs/cgroup"]
++    for cap in CAPS:
++        cmd += ["--cap-add", cap]
++    cmd += _device_opts(args, cfg)
++
++    data_volume = _ensure_data_volume(args, cfg)
++    cmd += ["-v", "{}:/data".format(data_volume)]
++    cmd += ["-v", "{}:/vendor/waydroid.prop:ro".format(args.work + "/waydroid.prop")]
++    cmd += ["--tmpfs", "/run", "--tmpfs", "/var", "--tmpfs", "/tmp"]
++    cmd += _socket_binds(args, cfg, session)
++
++    # Host-owned directory for the binder fd broker's sockets and binary.
++    binder_dir = _binder_dir(args)
++    os.makedirs(binder_dir, exist_ok=True)
++    cmd += ["-v", "{}:/run/wd-binder".format(binder_dir)]
++
++    kmsg = os.environ.get("WD_KMSG_LOG")
++    if kmsg:
++        os.makedirs(os.path.dirname(kmsg), exist_ok=True)
++        open(kmsg, "w").close()
++        cmd += ["-v", "{}:/dev/kmsg".format(kmsg)]
++
++    cmd += _stage_host_files(args, cfg, tmp)
++
++    run_root = [image]
++
++    extra = os.environ.get("WD_EXTRA")
++    if extra:
++        cmd += extra.split()
++    cmd += run_root
++    cmd += ["/devstage"]
++    return cmd, path_prefix
++
++
++# --- backend interface ----------------------------------------------------
++
++def _image_exists(image):
++    if not image:
++        return False
++    result = subprocess.run(["podman", "image", "exists", image],
++                            stdout=subprocess.DEVNULL,
++                            stderr=subprocess.DEVNULL)
++    return result.returncode == 0
++
++
++def uses_image(args):
++    """The podman backend boots an OCI image directly; system/vendor images
++    are build-system inputs, not runtime state."""
++    return True
++
++
++def is_initialized(args):
++    if not os.path.isfile(args.config):
++        return False
++    return _image_exists(_image(args, _cfg(args)))
++
++
++def waydroid_data_dir(args):
++    """Host mountpoint of the named podman volume mounted at /data."""
++    return _data_dir(args, _cfg(args))
++
++
++def host_binder(args):
++    # The fd broker (binder_device_paths) makes Android's servicemanager
++    # reachable from the host even though binderfs is container-local.  The
++    # legacy "host" mode, which handed the host's binderfs nodes to the
++    # container, cannot work rootless (BINDER_SET_CONTEXT_MGR is EPERM), so it
++    # is not advertised.
++    return _cfg(args)["waydroid"].get("podman_binderfs") != "host"
++
++
++def setup_host(args):
++    cfg = _cfg(args)
++    _ensure_cfg_args(args, cfg)
++    image = _image(args, cfg)
++    if not image:
++        raise RuntimeError(
++            "the rootless podman backend requires podman_image (an OCI "
++            "image); there is no external-rootfs mode")
++    if not _image_exists(image):
++        raise RuntimeError(
++            "podman image {} not found; build it with image/build.sh "
++            "or pull it with podman".format(image))
++    _ensure_data_volume(args, cfg)
++    logging.info("[podman] image: %s (update = rebuild/pull this image; "
++                 "the /data volume is preserved)", image)
++
++    driver = _storage_driver()
++    if driver != "overlay":
++        logging.warning("[podman] storage driver is %r; overlay is preferred",
++                        driver)
++    if "fuse-overlayfs" in _storage_options():
++        logging.info("[podman] storage uses fuse-overlayfs; native kernel "
++                     "overlayfs is preferred")
++
++    # Generic host GPU/HAL property probing -- not LXC configuration.  It still
++    # lives in tools/helpers/lxc.py; see the note in the RFC about moving it to
++    # a shared runtime/hostprops.py.
++    from tools.helpers import lxc as _lxc
++    _lxc.make_base_props(args)
++    os.makedirs(_data_dir(args, cfg), exist_ok=True)
++    os.makedirs(_work_tmp(args), exist_ok=True)
++
++
++def prepare_drivers(args):
++    # binderfs is created by devstage inside the container; the host reaches it
++    # lazily through binder_device_paths(), once the container is running.
++    return
++
++
++def setup_host_services(args):
++    # pasta does the networking inside the container; no sensord/cgroup/NFC
++    # host services are involved.
++    return
++
++
++def teardown_host_services(args):
++    return
++
++
++def _force_sensors_stub(prop_path):
++    """Sensors go through the host's /dev/hwbinder, which the fd broker does
++    not cover (waydroid-sensord is a host binary).  Always stub the HAL."""
++    with open(prop_path) as f:
++        lines = f.read().splitlines()
++    lines = [line for line in lines
++             if not line.startswith("waydroid.stub_sensors_hal=")]
++    lines.append("waydroid.stub_sensors_hal=1")
++    with open(prop_path, "w") as f:
++        f.write("\n".join(lines) + "\n")
++
++
++def prepare_session(args, session):
++    cfg = _cfg(args)
++    _ensure_cfg_args(args, cfg)
++    _ensure_data_volume(args, cfg)
++
++    if not os.path.isfile(args.work + "/waydroid_base.prop"):
++        from tools.helpers import lxc as _lxc
++        _lxc.make_base_props(args)
++    helpers.images.make_prop(args, session, args.work + "/waydroid.prop")
++    _force_sensors_stub(args.work + "/waydroid.prop")
++
++    os.makedirs(_work_tmp(args), exist_ok=True)
++    _devstage(args)
++
++
++def teardown_session(args):
++    # podman throws its writable overlay away with the container; nothing to do.
++    return
++
++
++def _image_build_prop(args, cfg):
++    """Read /system/build.prop out of an image without booting it."""
++    image = _image(args, cfg)
++    if not image:
++        return None
++    result = subprocess.run(["podman", "create", image],
++                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
++                            text=True)
++    if result.returncode != 0 or not result.stdout.strip():
++        return None
++    cid = result.stdout.strip()
++    dst = os.path.join(_work_tmp(args), "build.prop")
++    os.makedirs(os.path.dirname(dst), exist_ok=True)
++    try:
++        cp = subprocess.run(["podman", "cp", cid + ":/system/build.prop", dst],
++                            stdout=subprocess.DEVNULL,
++                            stderr=subprocess.DEVNULL)
++        return dst if cp.returncode == 0 and os.path.isfile(dst) else None
++    finally:
++        subprocess.run(["podman", "rm", "-f", cid],
++                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++
++
++def set_protocol(args):
++    cfg = _cfg(args)
++    build_prop = _image_build_prop(args, cfg)
++    if not build_prop:
++        logging.error("[podman] could not read /system/build.prop from %s; "
++                      "keeping the configured binder protocol",
++                      _image(args, cfg))
++        return
++    helpers.protocol.set_aidl_version(args, build_prop)
++
++
++def _podman_state(args, name):
++    with suppress(Exception):
++        out = subprocess.run(["podman", "inspect", "-f", "{{.State.Status}}", name],
++                             capture_output=True, text=True)
++        if out.returncode == 0:
++            return out.stdout.strip()
++    return None
++
++
++def status(args):
++    state = _podman_state(args, _name(_cfg(args)))
++    if state == "running":
++        return "RUNNING"
++    if state == "paused":
++        return "FROZEN"
++    return "STOPPED"
++
++
++def start(args, session):
++    cfg = _cfg(args)
++    name = _name(cfg)
++    cmd, path_prefix = _build_run_cmd(args, session)
++
++    tools.helpers.run.user(args, ["podman", "rm", "-f", name], check=False)
++
++    env = {}
++    if path_prefix:
++        env["PATH"] = path_prefix + ":" + os.environ.get("PATH", "")
++    tools.helpers.run.user(args, cmd, env=env)
++
++    timeout = 10
++    while status(args) != "RUNNING" and timeout > 0:
++        logging.info("waiting %s seconds for container to start...", timeout)
++        timeout -= 1
++        time.sleep(1)
++    if status(args) != "RUNNING":
++        raise OSError("container failed to start")
++    with suppress(OSError):
++        os.chmod(args.log, 0o666)
++
++
++def stop(args):
++    name = _name(_cfg(args))
++    tools.helpers.run.user(args, ["podman", "stop", "-t", "5", name], check=False)
++    tools.helpers.run.user(args, ["podman", "rm", "-f", name], check=False)
++
++
++def freeze(args):
++    tools.helpers.run.user(args, ["podman", "pause", _name(_cfg(args))], check=False)
++
++
++def unfreeze(args):
++    tools.helpers.run.user(args, ["podman", "unpause", _name(_cfg(args))], check=False)
++
++
++def _exec_cmd(args, command, interactive=False):
++    cmd = ["podman", "exec"]
++    if interactive:
++        cmd.append("-i")
++        if sys.stdin.isatty():
++            cmd.append("-t")
++    for key, value in ANDROID_ENV.items():
++        cmd += ["--env", "{}={}".format(key, value)]
++    if getattr(args, "uid", None) is not None:
++        gid = args.gid if args.gid is not None else args.uid
++        cmd += ["--user", "{}:{}".format(args.uid, gid)]
++    cmd.append(_name(_cfg(args)))
++    cmd += command
++    return cmd
++
++
++def exec_output(args, command, user=None):
++    """Run a command in the container; return (rc, combined output)."""
++    cmd = ["podman", "exec"]
++    if user is not None:
++        cmd += ["--user", str(user)]
++    cmd.append(_name(_cfg(args)))
++    cmd += command
++    result = subprocess.run(cmd, stdout=subprocess.PIPE,
++                            stderr=subprocess.STDOUT, text=True)
++    return result.returncode, result.stdout
++
++
++def adb_address(args):
++    """Host loopback address pasta forwards to the container's adbd."""
++    port = str(_cfg(args)["waydroid"].get("podman_adb_port") or "5555")
++    if not re.match(r"^\d+$", port) or port == "0":
++        return None
++    return "127.0.0.1:" + port
++
++
++def device_ip_address(args):
++    """The container's IPv4 address.
++
++    pasta has no dnsmasq lease file, so read the container's own routing table
++    (podman exec runs in its network namespace).
++    """
++    if status(args) != "RUNNING":
++        return None
++    rc, out = exec_output(args, ["/system/bin/cat", "/proc/net/fib_trie"])
++    if rc != 0:
++        return None
++    candidates = []
++    lines = out.splitlines()
++    for i, line in enumerate(lines):
++        match = re.search(r"\|\-\-\s+(\d+\.\d+\.\d+\.\d+)\s*$", line)
++        if match and "/32 host LOCAL" in "\n".join(lines[i + 1:i + 3]):
++            candidates.append(match.group(1))
++    for addr in candidates:
++        if not addr.startswith("127.") and not addr.startswith("169.254."):
++            return addr
++    return candidates[0] if candidates else None
++
++
++def remove_app(args, package):
++    """Fallback for IPlatform.removeApp, which returns -1 on this image."""
++    rc, _ = exec_output(args, ["/system/bin/pm", "uninstall", package])
++    return rc
++
++
++def push_apk(args, host_path):
++    """Copy an APK into the container's writable layer with podman cp.
++
++    The destination is the container root (owned by container root, which maps
++    to the user), so this works without touching /data permissions; the file is
++    discarded with the container.
++    """
++    dst = "/tmp/waydroid-install.apk"
++    result = subprocess.run(
++        ["podman", "cp", host_path, "{}:{}".format(_name(_cfg(args)), dst)],
++        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++    if result.returncode != 0:
++        raise RuntimeError("podman cp failed: {}".format(result.stdout.strip()))
++    return dst
++
++
++def remove_apk(args, container_path):
++    exec_output(args, ["/system/bin/rm", "-f", container_path])
++
++
++def shell(args):
++    state = status(args)
++    if state == "FROZEN":
++        unfreeze(args)
++    elif state != "RUNNING":
++        logging.error("WayDroid container is {}".format(state))
++        return
++
++    command = list(args.COMMAND) if args.COMMAND else ["/system/bin/sh"]
++    cmd = _exec_cmd(args, command, interactive=True)
++
++    import signal
++
++    def mock_sigint(signum, frame):
++        raise KeyboardInterrupt
++
++    signal.signal(signal.SIGTERM, mock_sigint)
++    signal.signal(signal.SIGHUP, mock_sigint)
++
++    perms = stat.S_IMODE(os.stat(sys.stdout.fileno()).st_mode)
++    try:
++        subprocess.run(cmd)
++    except KeyboardInterrupt:
++        pass
++    finally:
++        os.chmod(sys.stdout.fileno(), perms)
++
++    if state == "FROZEN":
++        freeze(args)
++
++
++def logcat(args):
++    args.COMMAND = ["/system/bin/logcat"]
++    if args.ARGS:
++        args.COMMAND.extend(args.ARGS)
++    args.uid = None
++    args.gid = None
++    shell(args)
+diff --git a/tools/helpers/runtime/wd-broker.c b/tools/helpers/runtime/wd-broker.c
+new file mode 100644
+index 0000000..4774103
+--- /dev/null
++++ b/tools/helpers/runtime/wd-broker.c
+@@ -0,0 +1,94 @@
++/*
++ * wd-broker.c - hand a binder device fd from inside the container to the host.
++ *
++ * The rootless container creates its own binderfs (see devstage.c).  Its nodes
++ * live in the container's mount namespace, and binderfs nodes cannot be
++ * reopened through a raw mknod() of the same major:minor (ENXIO), so the host
++ * cannot simply open them.  This helper runs *inside* the container, opens the
++ * node, listens on a unix socket that is bind-mounted from the host, and sends
++ * the open fd to whoever connects (SCM_RIGHTS).  The receiver turns it into
++ * "/dev/fd/<n>" and hands it to gbinder; the kernel keeps the same binder_proc
++ * / binder context alive, so the host talks to Android's servicemanager.
++ *
++ * It serves exactly one client per device and exits.
++ *
++ * Usage: wd-broker <device> <socket>
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++
++int main(int argc, char **argv) {
++    if (argc < 3) {
++        fprintf(stderr, "usage: %s <device> <socket>\n", argv[0]);
++        return 2;
++    }
++
++    int fd = open(argv[1], O_RDWR | O_CLOEXEC);
++    if (fd < 0) {
++        perror("open device");
++        return 1;
++    }
++
++    int s = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (s < 0) {
++        perror("socket");
++        return 1;
++    }
++
++    struct sockaddr_un addr;
++    memset(&addr, 0, sizeof(addr));
++    addr.sun_family = AF_UNIX;
++    strncpy(addr.sun_path, argv[2], sizeof(addr.sun_path) - 1);
++    unlink(argv[2]);
++
++    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
++        perror("bind");
++        return 1;
++    }
++    chmod(argv[2], 0777);
++
++    if (listen(s, 1) < 0) {
++        perror("listen");
++        return 1;
++    }
++
++    int c = accept(s, NULL, NULL);
++    if (c < 0) {
++        perror("accept");
++        return 1;
++    }
++
++    char byte = 'x';
++    struct iovec iov = { .iov_base = &byte, .iov_len = 1 };
++    char cmsgbuf[CMSG_SPACE(sizeof(int))];
++    struct msghdr msg;
++    memset(&msg, 0, sizeof(msg));
++    msg.msg_iov = &iov;
++    msg.msg_iovlen = 1;
++    msg.msg_control = cmsgbuf;
++    msg.msg_controllen = sizeof(cmsgbuf);
++
++    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
++    cmsg->cmsg_level = SOL_SOCKET;
++    cmsg->cmsg_type = SCM_RIGHTS;
++    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
++    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
++
++    if (sendmsg(c, &msg, 0) < 0) {
++        perror("sendmsg");
++        return 1;
++    }
++
++    /* The receiver now owns a reference; our copy can go. */
++    close(fd);
++    close(c);
++    close(s);
++    unlink(argv[2]);
++    return 0;
++}
+diff --git a/tools/helpers/service.py b/tools/helpers/service.py
+new file mode 100644
+index 0000000..fc11cac
+--- /dev/null
++++ b/tools/helpers/service.py
+@@ -0,0 +1,29 @@
++# Copyright 2026 The Waydroid contributors
++# SPDX-License-Identifier: GPL-3.0-or-later
++"""Small helpers for the per-user service model."""
++import logging
++import shutil
++import subprocess
++
++
++def restart_user_service(args):
++    """Restart (or start) the per-user waydroid.service.
++
++    Returns True when systemd accepted the restart.  A non-systemd/manual
++    setup returns False and the caller should tell the user to start a
++    session explicitly.
++    """
++    if not shutil.which("systemctl"):
++        return False
++    try:
++        result = subprocess.run(
++            ["systemctl", "--user", "restart", "waydroid.service"],
++            capture_output=True, text=True, timeout=60)
++    except Exception as e:
++        logging.debug("systemctl --user restart failed: %s", e)
++        return False
++    if result.returncode != 0:
++        logging.debug("systemctl --user restart failed: %s",
++                      (result.stderr or result.stdout).strip())
++        return False
++    return True
+diff --git a/tools/services/hardware_manager.py b/tools/services/hardware_manager.py
+index 072df41..b3ecd97 100644
+--- a/tools/services/hardware_manager.py
++++ b/tools/services/hardware_manager.py
+@@ -27,24 +27,27 @@ def start(args):
+             tools.actions.container_manager.freeze(args)
+ 
+     def reboot():
+-        helpers.lxc.stop(args)
+-        helpers.lxc.start(args)
++        backend = helpers.runtime.get(args)
++        backend.stop(args)
++        backend.start(args, getattr(args, "session", None))
+ 
+     def upgrade(system_zip, system_time, vendor_zip, vendor_time):
+-        helpers.lxc.stop(args)
++        backend = helpers.runtime.get(args)
++        backend.stop(args)
+         helpers.images.umount_rootfs(args)
+         helpers.images.replace(args, system_zip, system_time,
+                                vendor_zip, vendor_time)
+         args.session["background_start"] = "false"
+         helpers.images.mount_rootfs(args, args.images_path, args.session)
+-        helpers.protocol.set_aidl_version(args)
+-        helpers.lxc.start(args)
++        backend.set_protocol(args)
++        backend.start(args, args.session)
+ 
+     def shutdownRequest(reason):
+         is_reboot = reason and reason.startswith("1")
+         tries = 0
+ 
+-        while helpers.lxc.status(args) != "STOPPED":
++        backend = helpers.runtime.get(args)
++        while backend.status(args) != "STOPPED":
+             if tries >= 30:
+                 logging.debug(f"Android is still not stopped, give up waiting after {tries} seconds")
+                 return
+@@ -54,7 +57,7 @@ def start(args):
+             tries += 1
+ 
+         if is_reboot:
+-            helpers.lxc.start(args)
++            backend.start(args, getattr(args, "session", None))
+         else:
+             tools.actions.container_manager.stop(args)
+ 
+diff --git a/tools/services/user_manager.py b/tools/services/user_manager.py
+index 517812f..916e0dd 100644
+--- a/tools/services/user_manager.py
++++ b/tools/services/user_manager.py
+@@ -19,7 +19,9 @@ def start(args, session, unlocked_cb=None):
+     apps_dir.mkdir(0o700, exist_ok=True)
+ 
+     waydroid_user_state_dir = Path(session["waydroid_user_state"])
+-    waydroid_data_icons_dir = Path(session["waydroid_data"]) / "icons"
++    waydroid_data_icons_dir = Path(
++        session.get("waydroid_icons")
++        or (Path(session["waydroid_data"]) / "icons"))
+ 
+     system_apps = [
+         "com.android.calculator2",

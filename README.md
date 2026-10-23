@@ -2,6 +2,11 @@
 
 # Waydroid
 
+> **Rootless podman backend.**  This tree carries the rootless backend
+> documented in [ROOTLESS.md](ROOTLESS.md).  The bootable OCI image is built
+> and published from
+> [waydroid-rootless-image](https://github.com/dingdang66686/waydroid-rootless-image).
+
 Waydroid uses a container-based approach to boot a full Android system on a
 regular GNU/Linux system.
 
