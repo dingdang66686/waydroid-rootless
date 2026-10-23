@@ -40,6 +40,7 @@ import tools.config
 import tools.helpers.run
 from tools import helpers
 from tools.helpers.lxc import ANDROID_ENV
+from tools.helpers.runtime import overlay as _overlay
 
 
 NAME = "podman"
@@ -72,7 +73,10 @@ def _name(cfg):
 
 
 def _image(args, cfg):
-    return cfg["waydroid"].get("podman_image") or ""
+    # The session process may select a locally overlaid derivative for this
+    # run; it is not written back to waydroid.cfg.
+    return (getattr(args, "podman_overlay_image", None)
+            or cfg["waydroid"].get("podman_image") or "")
 
 
 def _data_volume(cfg):
@@ -760,6 +764,10 @@ def prepare_session(args, session):
     _ensure_cfg_args(args, cfg)
     _ensure_data_volume(args, cfg)
 
+    # Apply the local overlay (if any) once, before set_protocol() reads the
+    # image build.prop and before the container starts.
+    args.podman_overlay_image = _overlay.ensure(args, cfg)
+
     if not os.path.isfile(args.work + "/waydroid_base.prop"):
         from tools.helpers import lxc as _lxc
         _lxc.make_base_props(args)
@@ -829,6 +837,9 @@ def status(args):
 
 def start(args, session):
     cfg = _cfg(args)
+    # container restart bypasses prepare_session(), so check the overlay here
+    # too.  The check is cheap when the stamp matches.
+    args.podman_overlay_image = _overlay.ensure(args, cfg)
     name = _name(cfg)
     cmd, path_prefix = _build_run_cmd(args, session)
 

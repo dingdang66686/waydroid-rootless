@@ -31,7 +31,9 @@ config_keys = ["arch",
                "podman_adb_port",
                "podman_binderfs",
                "podman_uid_map",
-               "podman_pasta_options"]
+               "podman_pasta_options",
+               "podman_overlay_path",
+               "podman_overlay_image"]
 
 # Config file/commandline default values
 # $WORK gets replaced with the actual value for args.work (which may be
@@ -82,6 +84,15 @@ defaults = {
     #                      --userns= value
     #   podman_pasta_options - extra comma-separated pasta options appended to
     #                      the --network string
+    #   podman_overlay_path - local overlay directory checked at every
+    #                      container start (default: $WORK/overlay).  Its
+    #                      rootfs/, props/ and remove.list are applied to the
+    #                      base image; the result is imported as
+    #                      podman_overlay_image.  Empty/absent means no
+    #                      overlay (the normal public-image path).
+    #   podman_overlay_image - derived image tag for the local overlay
+    #                      (default: localhost/waydroid-overlay:<base tag>).
+    #                      It must differ from podman_image.
     "podman_image": "",
     "podman_image_remote": "registry.example.invalid/waydroid/waydroid-arm64:13",
     "podman_data_volume": "waydroid-data",
@@ -89,6 +100,8 @@ defaults = {
     "podman_binderfs": "container",
     "podman_uid_map": "auto",
     "podman_pasta_options": "",
+    "podman_overlay_path": "",
+    "podman_overlay_image": "",
 }
 defaults["images_path"] = defaults["work"] + "/images"
 defaults["rootfs"] = defaults["work"] + "/rootfs"
