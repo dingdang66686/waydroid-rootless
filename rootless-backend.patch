@@ -2296,7 +2296,7 @@ index 0000000..de93d14
 +    _lxc.logcat(args)
 diff --git a/tools/helpers/runtime/overlay.py b/tools/helpers/runtime/overlay.py
 new file mode 100644
-index 0000000..418d03b
+index 0000000..5781d47
 --- /dev/null
 +++ b/tools/helpers/runtime/overlay.py
 @@ -0,0 +1,455 @@
@@ -2671,7 +2671,7 @@ index 0000000..418d03b
 +        if stamp.get(key) != expected:
 +            return False
 +    image_id = stamp.get("image_id")
-+    if not image_id or not _image_exists(image):
++    if not image_id or image_id == base_id or not _image_exists(image):
 +        return False
 +    return _image_id(image) == image_id
 +
@@ -2694,7 +2694,7 @@ index 0000000..418d03b
 +        _write_tar(root, tar)
 +        _import(tar, image)
 +        image_id = _image_id(image)
-+        if old_id and old_id != image_id:
++        if old_id and old_id != image_id and old_id != base_id:
 +            # Drop the previous derived image when possible; a container
 +            # still using it makes podman refuse, which is fine.
 +            subprocess.run(["podman", "rmi", old_id],
