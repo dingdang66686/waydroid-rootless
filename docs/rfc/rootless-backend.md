@@ -1434,8 +1434,7 @@ user service; a failed pull leaves any running container untouched.  The
 ### C.8 Local overlay rebuild at session start
 
 The public image stays clean; a user may keep a private overlay tree in
-`$WORK/overlay` (configurable with `podman_overlay_path`).  It uses the same
-shape as the image-side prototype:
+`$WORK/overlay` (configurable with `podman_overlay_path`).  The layout is:
 
 ```
 overlay/
