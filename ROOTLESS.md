@@ -43,7 +43,8 @@ SigLevel = Required DatabaseRequired
 Import and trust the repository key:
 
 ```sh
-sudo pacman-key --add https://dingdang66686.github.io/waydroid-rootless-arch/x86_64/waydroid-rootless.asc
+curl -fsSL https://dingdang66686.github.io/waydroid-rootless-arch/x86_64/waydroid-rootless.asc -o /tmp/waydroid-rootless.asc
+sudo pacman-key --add /tmp/waydroid-rootless.asc
 sudo pacman-key --lsign-key B5B9D60481516AFE4E2DC8931F298A3142A4810C
 ```
 
