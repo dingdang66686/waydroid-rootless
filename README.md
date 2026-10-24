@@ -17,9 +17,11 @@
 >
 > ```sh
 > podman pull ghcr.io/dingdang66686/waydroid-rootless-image:13
-> sudo pacman -S waydroid-rootless
-> systemctl --user enable --now waydroid-rootless.service
+> sudo pacman -S waydroid
+> systemctl --user enable --now waydroid.service
 > ```
+>
+> The package replaces the distro `waydroid` package (Arch only).
 >
 > Local overlays are supported; see `ROOTLESS.md`.
 

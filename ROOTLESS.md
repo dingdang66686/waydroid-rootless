@@ -44,11 +44,12 @@ Then:
 
 ```sh
 podman pull ghcr.io/dingdang66686/waydroid-rootless-image:13
-sudo pacman -S waydroid-rootless
-systemctl --user enable --now waydroid-rootless.service
+sudo pacman -S waydroid
+systemctl --user enable --now waydroid.service
 ```
 
-The package installs the rootless launcher and user unit, disables the rootful
+On Arch, this package replaces the distro `waydroid` package, installs the
+rootless launcher and user unit, disables the rootful
 `waydroid-container.service`, and keeps `/data` in the named volume.
 
 ## Image
