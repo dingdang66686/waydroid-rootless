@@ -114,19 +114,6 @@ def _data_dir(args, cfg):
     return mountpoint
 
 
-def _fix_data_owner(args, cfg):
-    """Map the named volume root to Android's AOSP /data ownership (0:1000)."""
-    if str(cfg["waydroid"].get("podman_uid_map", "auto")) not in ("auto", ""):
-        logging.info("[podman] custom userns mapping; leaving /data root owner")
-        return
-    mountpoint = _data_dir(args, cfg)
-    result = subprocess.run(["podman", "unshare", "chown", "0:1000", mountpoint],
-                            capture_output=True, text=True)
-    if result.returncode != 0:
-        logging.warning("[podman] could not set /data root ownership: %s",
-                        result.stderr.strip() or result.stdout.strip())
-
-
 def _storage_driver():
     result = subprocess.run(
         ["podman", "info", "--format", "{{.Store.GraphDriverName}}"],
@@ -637,6 +624,10 @@ def _build_run_cmd(args, session):
     cmd += ["-v", "{}:/data".format(data_volume)]
     cmd += ["-v", "{}:/vendor/waydroid.prop:ro".format(args.work + "/waydroid.prop")]
     cmd += ["--tmpfs", "/run", "--tmpfs", "/var", "--tmpfs", "/tmp"]
+    # Android init expects a writable /dev/socket but does not create it on
+    # this image.  Keep the directory container-local and ephemeral instead of
+    # binding a host directory over it.  The host never uses these sockets.
+    cmd += ["--tmpfs", "/dev/socket:rw,nosuid,nodev,mode=0755"]
     cmd += _socket_binds(args, cfg, session)
 
     # Host-owned directory for the binder fd broker's sockets and binary.
@@ -764,7 +755,6 @@ def prepare_session(args, session):
     cfg = _cfg(args)
     _ensure_cfg_args(args, cfg)
     _ensure_data_volume(args, cfg)
-    _fix_data_owner(args, cfg)
 
     # Apply the local overlay (if any) once, before set_protocol() reads the
     # image build.prop and before the container starts.

@@ -110,21 +110,24 @@ root privileges.
 
 ### 3.4 Data volume and sockets
 
-`/data` is a named podman volume.  Its root directory is mapped to Android's
-AOSP ownership:
+`/data` is a named podman volume.  Android's own `init.rc` sets its ownership
+and mode:
 
 ```text
-/data   0:1000   0771
+chown system system /data
+chmod 0771 /data
 ```
 
-When a volume already exists with a different root owner, the backend fixes the
-root directory with `podman unshare chown 0:1000` at session start.  Files
-inside the volume keep their existing Android ownership.
+So the normal runtime value is **1000:1000 (system:system)**, not root.  The
+volume root is left to Android init; no host-side chown is needed.  The host
+mountpoint stores the container's mapped ownership.
 
-`/dev/socket` is **container-local**.  Android's first-stage init creates the
-directory and the services create their sockets there.  The host has no use for
-those sockets and must not bind a host directory over them; doing so only
-introduces stale-socket and permission problems.
+`/dev/socket` is also **container-local**.  This image does not pre-create the
+directory, and Android's property service fails with ENOENT if it is missing.
+The backend mounts a small tmpfs at `/dev/socket`; Android creates the sockets
+there and they disappear with the container.  The host never uses these
+sockets, so a host bind is neither needed nor desirable: it only leaks stale
+sockets and host permissions into Android.
 
 ### 3.5 Image updates and local overlays
 
@@ -156,10 +159,10 @@ of this basic file-tree mechanism.
 ### 3.6 Startup sequence
 
 1. The per-user `waydroid.service` starts `waydroid session start`.
-2. The backend prepares the data volume and its root ownership.
+2. The backend prepares the named data volume.
 3. The local overlay is checked and, if needed, rebuilt as a layer.
-4. The container starts with the rootfs image, `/data`, Wayland/Pulse/DRI and
-   the binder broker.
+4. The container starts with the rootfs image, `/data`, a local
+   `/dev/socket` tmpfs, Wayland/Pulse/DRI and the binder broker.
 5. The host sets the Android binder protocol from the image's build.prop.
 
 `container restart` repeats the overlay check.  There is no file watcher;
@@ -241,8 +244,7 @@ half-work.
 4. Move the three init overrides into the Android image/product build.
 5. Add CI for the CLI/session tests and a documented manual boot test for the
    actual Android container.
-6. Document `/data` ownership and the fact that `/dev/socket` is
-   container-local.
+6. Document AOSP `/data` ownership and the container-local `/dev/socket`.
 
 ## 8. Open questions
 

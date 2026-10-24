@@ -2620,10 +2620,10 @@ index 0000000..1583a41
 +    raise RuntimeError("overlay changed repeatedly while building {}".format(image))
 diff --git a/tools/helpers/runtime/podman.py b/tools/helpers/runtime/podman.py
 new file mode 100644
-index 0000000..f535da2
+index 0000000..4a21a82
 --- /dev/null
 +++ b/tools/helpers/runtime/podman.py
-@@ -0,0 +1,1000 @@
+@@ -0,0 +1,992 @@
 +# Copyright 2026 The Waydroid contributors
 +# SPDX-License-Identifier: GPL-3.0-or-later
 +"""
@@ -3204,18 +3204,6 @@ index 0000000..f535da2
 +        f.write("uevent_socket_rcvbuf_size {}\n".format(rmem))
 +    binds += ["-v", "{}:/vendor/ueventd.rc:ro".format(ueventd)]
 +
-+    # /dev/socket is created by mkdir() in the real first stage; it is a plain
-+    # host directory here, so sweep leftovers that would make bind() fail.
-+    dsock = os.path.join(tmp, "dev-socket")
-+    os.makedirs(dsock, exist_ok=True)
-+    for entry in os.listdir(dsock):
-+        path = os.path.join(dsock, entry)
-+        with suppress(OSError):
-+            if os.path.isdir(path) and not os.path.islink(path):
-+                shutil.rmtree(path)
-+            else:
-+                os.unlink(path)
-+    binds += ["-v", "{}:/dev/socket".format(dsock)]
 +    binds += ["-v", "{}:/devstage:ro".format(_devstage(args))]
 +
 +    return binds
@@ -3262,6 +3250,10 @@ index 0000000..f535da2
 +    cmd += ["-v", "{}:/data".format(data_volume)]
 +    cmd += ["-v", "{}:/vendor/waydroid.prop:ro".format(args.work + "/waydroid.prop")]
 +    cmd += ["--tmpfs", "/run", "--tmpfs", "/var", "--tmpfs", "/tmp"]
++    # Android init expects a writable /dev/socket but does not create it on
++    # this image.  Keep the directory container-local and ephemeral instead of
++    # binding a host directory over it.  The host never uses these sockets.
++    cmd += ["--tmpfs", "/dev/socket:rw,nosuid,nodev,mode=0755"]
 +    cmd += _socket_binds(args, cfg, session)
 +
 +    # Host-owned directory for the binder fd broker's sockets and binary.
