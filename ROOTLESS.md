@@ -54,8 +54,7 @@ The installer:
 - installs the per-user `waydroid.service` (`waydroid session start`);
 - disables the rootful `waydroid-container.service` if present.
 
-Use a different image/tag with `WAYDROID_IMAGE=... ./install-rootless.sh install`
-(for example your own image with an ARM translation overlay).
+Use a different image/tag with `WAYDROID_IMAGE=... ./install-rootless.sh install`.
 
 Rollback:
 
