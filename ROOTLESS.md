@@ -32,7 +32,7 @@ no runtime overlay, and no per-run bind-mount of the Android `.rc` files.
 
 ## Install
 
-Add the package repository to `/etc/pacman.conf`:
+Add the package repository to `/etc/pacman.conf` before `[core]`/`[extra]`:
 
 ```ini
 [waydroid-rootless]
