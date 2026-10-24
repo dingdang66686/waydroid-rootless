@@ -37,13 +37,21 @@ Add the package repository to `/etc/pacman.conf` before `[core]`/`[extra]`:
 ```ini
 [waydroid-rootless]
 Server = https://dingdang66686.github.io/waydroid-rootless-arch/$arch
-SigLevel = Optional TrustAll
+SigLevel = Required DatabaseRequired
+```
+
+Import and trust the repository key:
+
+```sh
+sudo pacman-key --add https://dingdang66686.github.io/waydroid-rootless-arch/x86_64/waydroid-rootless.asc
+sudo pacman-key --lsign-key B5B9D60481516AFE4E2DC8931F298A3142A4810C
 ```
 
 Then:
 
 ```sh
 podman pull ghcr.io/dingdang66686/waydroid-rootless-image:13
+sudo pacman -Sy
 sudo pacman -S waydroid
 systemctl --user enable --now waydroid.service
 ```
