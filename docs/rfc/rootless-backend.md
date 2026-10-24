@@ -124,10 +124,12 @@ mountpoint stores the container's mapped ownership.
 
 `/dev/socket` is also **container-local**.  This image does not pre-create the
 directory, and Android's property service fails with ENOENT if it is missing.
-The backend mounts a small tmpfs at `/dev/socket`; Android creates the sockets
-there and they disappear with the container.  The host never uses these
-sockets, so a host bind is neither needed nor desirable: it only leaks stale
-sockets and host permissions into Android.
+The backend starts init at its second stage (the first stage needs root-only
+`mknod`/proc operations), so the normal first-stage creation of this directory
+is skipped.  A small tmpfs is mounted at `/dev/socket` instead; Android creates
+the sockets there and they disappear with the container.  The host never uses
+these sockets, so a host bind is neither needed nor desirable: it only leaks
+stale sockets and host permissions into Android.
 
 ### 3.5 Image updates and local overlays
 
