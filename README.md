@@ -16,8 +16,7 @@
 > ./install-rootless.sh install
 > ```
 >
-> The public image is the plain patched Android 13 rootfs; add the ARM
-> translation layer as a local runtime overlay (see `ROOTLESS.md`).
+> Local overlays are supported; see `ROOTLESS.md`.
 
 Waydroid uses a container-based approach to boot a full Android system on a
 regular GNU/Linux system.
