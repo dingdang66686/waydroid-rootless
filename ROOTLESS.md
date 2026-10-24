@@ -32,37 +32,24 @@ no runtime overlay, and no per-run bind-mount of the Android `.rc` files.
 
 ## Install
 
-```sh
-git clone https://github.com/dingdang66686/waydroid-rootless
-cd waydroid-rootless
+Add the package repository to `/etc/pacman.conf`:
 
-# The plain patched Android 13 image published by this project
-# (if the GHCR package is private, run `podman login ghcr.io` first):
+```ini
+[waydroid-rootless]
+Server = https://dingdang66686.github.io/waydroid-rootless-arch/$arch
+SigLevel = Optional TrustAll
+```
+
+Then:
+
+```sh
 podman pull ghcr.io/dingdang66686/waydroid-rootless-image:13
-
-./install-rootless.sh install
+sudo pacman -S waydroid-rootless
+systemctl --user enable --now waydroid-rootless.service
 ```
 
-The installer:
-
-- copies `tools/` and `waydroid.py` to `/opt/waydroid-rootless`;
-- writes `/usr/local/bin/waydroid` (root keeps using the distro binary);
-- creates `~/.local/state/waydroid/waydroid.cfg` with
-  `container_backend = podman`,
-  `podman_image = ghcr.io/dingdang66686/waydroid-rootless-image:13`,
-  `podman_data_volume = waydroid-data`;
-- installs the per-user `waydroid.service` (`waydroid session start`);
-- disables the rootful `waydroid-container.service` if present.
-
-Use a different image/tag with `WAYDROID_IMAGE=... ./install-rootless.sh install`.
-
-Rollback:
-
-```sh
-./install-rootless.sh uninstall
-```
-
-The distro package and `/var/lib/waydroid/data` are left intact.
+The package installs the rootless launcher and user unit, disables the rootful
+`waydroid-container.service`, and keeps `/data` in the named volume.
 
 ## Image
 

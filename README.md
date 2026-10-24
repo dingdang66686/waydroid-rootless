@@ -11,9 +11,14 @@
 > and the published image is
 > `ghcr.io/dingdang66686/waydroid-rootless-image:13`:
 >
+> The Arch package repository is
+> [dingdang66686/waydroid-rootless-arch](https://github.com/dingdang66686/waydroid-rootless-arch).
+> Once the repository is configured:
+>
 > ```sh
 > podman pull ghcr.io/dingdang66686/waydroid-rootless-image:13
-> ./install-rootless.sh install
+> sudo pacman -S waydroid-rootless
+> systemctl --user enable --now waydroid-rootless.service
 > ```
 >
 > Local overlays are supported; see `ROOTLESS.md`.
