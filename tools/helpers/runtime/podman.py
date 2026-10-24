@@ -114,6 +114,19 @@ def _data_dir(args, cfg):
     return mountpoint
 
 
+def _fix_data_owner(args, cfg):
+    """Map the named volume root to Android's AOSP /data ownership (0:1000)."""
+    if str(cfg["waydroid"].get("podman_uid_map", "auto")) not in ("auto", ""):
+        logging.info("[podman] custom userns mapping; leaving /data root owner")
+        return
+    mountpoint = _data_dir(args, cfg)
+    result = subprocess.run(["podman", "unshare", "chown", "0:1000", mountpoint],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        logging.warning("[podman] could not set /data root ownership: %s",
+                        result.stderr.strip() or result.stdout.strip())
+
+
 def _storage_driver():
     result = subprocess.run(
         ["podman", "info", "--format", "{{.Store.GraphDriverName}}"],
@@ -578,18 +591,6 @@ def _stage_host_files(args, cfg, tmp):
         f.write("uevent_socket_rcvbuf_size {}\n".format(rmem))
     binds += ["-v", "{}:/vendor/ueventd.rc:ro".format(ueventd)]
 
-    # /dev/socket is created by mkdir() in the real first stage; it is a plain
-    # host directory here, so sweep leftovers that would make bind() fail.
-    dsock = os.path.join(tmp, "dev-socket")
-    os.makedirs(dsock, exist_ok=True)
-    for entry in os.listdir(dsock):
-        path = os.path.join(dsock, entry)
-        with suppress(OSError):
-            if os.path.isdir(path) and not os.path.islink(path):
-                shutil.rmtree(path)
-            else:
-                os.unlink(path)
-    binds += ["-v", "{}:/dev/socket".format(dsock)]
     binds += ["-v", "{}:/devstage:ro".format(_devstage(args))]
 
     return binds
@@ -763,6 +764,7 @@ def prepare_session(args, session):
     cfg = _cfg(args)
     _ensure_cfg_args(args, cfg)
     _ensure_data_volume(args, cfg)
+    _fix_data_owner(args, cfg)
 
     # Apply the local overlay (if any) once, before set_protocol() reads the
     # image build.prop and before the container starts.
