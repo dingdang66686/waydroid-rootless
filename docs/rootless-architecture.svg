@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="520" viewBox="0 0 1000 520">
+  <rect width="1000" height="520" fill="#ffffff"/>
+  <style>
+    .box { fill: #f6f8fa; stroke: #59636e; stroke-width: 1.5; rx: 10; }
+    .accent { fill: #ddf4ff; stroke: #0969da; }
+    .label { font: 600 16px system-ui, sans-serif; fill: #1f2328; }
+    .small { font: 13px system-ui, sans-serif; fill: #59636e; }
+    .arrow { stroke: #59636e; stroke-width: 2; fill: none; marker-end: url(#a); }
+    .title { font: 700 24px system-ui, sans-serif; fill: #1f2328; }
+  </style>
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#59636e"/>
+    </marker>
+  </defs>
+  <text x="30" y="42" class="title">Waydroid rootless backend (prototype)</text>
+  <text x="30" y="66" class="small">one OCI image + one named /data volume, no rootful LXC</text>
+
+  <rect x="30" y="105" width="250" height="130" class="box"/>
+  <text x="50" y="137" class="label">Desktop user</text>
+  <text x="50" y="164" class="small">waydroid CLI / D-Bus session</text>
+  <text x="50" y="188" class="small">Wayland · Pulse · DRI</text>
+
+  <rect x="375" y="105" width="250" height="130" class="box accent"/>
+  <text x="395" y="137" class="label">podman (rootless)</text>
+  <text x="395" y="164" class="small">crun · pasta · binder fd broker</text>
+  <text x="395" y="188" class="small">131072-UID submap</text>
+
+  <rect x="720" y="105" width="250" height="130" class="box"/>
+  <text x="740" y="137" class="label">Android 13</text>
+  <text x="740" y="164" class="small">patched rootfs · /system · /vendor</text>
+  <text x="740" y="188" class="small">apps · ADB · UI</text>
+
+  <rect x="375" y="295" width="250" height="110" class="box"/>
+  <text x="395" y="327" class="label">Named volume</text>
+  <text x="395" y="354" class="small">/data (persistent)</text>
+
+  <rect x="30" y="295" width="250" height="110" class="box"/>
+  <text x="50" y="327" class="label">GHCR base image</text>
+  <text x="50" y="354" class="small">ghcr.io/…/waydroid-rootless-image:13</text>
+
+  <rect x="720" y="295" width="250" height="110" class="box accent"/>
+  <text x="740" y="327" class="label">Local overlay</text>
+  <text x="740" y="354" class="small">file tree → COPY layer</text>
+  <text x="740" y="376" class="small">rebuilt on start when changed</text>
+
+  <path d="M280 170 L365 170" class="arrow"/>
+  <path d="M625 170 L710 170" class="arrow"/>
+  <path d="M500 235 L500 285" class="arrow"/>
+  <path d="M280 350 L365 350" class="arrow"/>
+  <path d="M625 350 L710 350" class="arrow"/>
+
+  <text x="30" y="470" class="small">Tested on Arch Linux + kernel 7.2 + rootless podman 6.1; still a prototype, not an upstream-ready patch series.</text>
+  <text x="30" y="495" class="small">Implementation and write-up assisted by DeepSeek Flash V4.1.</text>
+</svg>
